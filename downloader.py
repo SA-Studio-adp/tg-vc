@@ -7,7 +7,7 @@ import uuid
 import asyncio
 import yt_dlp
 
-from config import DOWNLOAD_DIR
+from config import DOWNLOAD_DIR, COOKIES_FILE
 
 
 class DownloadResult:
@@ -24,12 +24,24 @@ def _job_dir():
     return d
 
 
+def _base_opts() -> dict:
+    """Options shared by every yt-dlp call, notably cookies — YouTube
+    frequently demands "sign in to confirm you're not a bot" for requests
+    coming from datacenter IPs (e.g. Render's), and cookies from a real
+    logged-in session are the standard fix."""
+    opts = {}
+    if COOKIES_FILE and os.path.isfile(COOKIES_FILE):
+        opts["cookiefile"] = COOKIES_FILE
+    return opts
+
+
 def _run_ytdlp(url: str, audio_only: bool) -> DownloadResult:
     job_dir = _job_dir()
     out_tmpl = os.path.join(job_dir, "%(id)s.%(ext)s")
 
     if audio_only:
         ydl_opts = {
+            **_base_opts(),
             "format": "bestaudio/best",
             "outtmpl": out_tmpl,
             "postprocessors": [{
@@ -43,6 +55,7 @@ def _run_ytdlp(url: str, audio_only: bool) -> DownloadResult:
         }
     else:
         ydl_opts = {
+            **_base_opts(),
             "format": "bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/best[height<=1080][ext=mp4]/best",
             "outtmpl": out_tmpl,
             "merge_output_format": "mp4",
@@ -77,6 +90,7 @@ def _run_direct_download(url: str) -> DownloadResult:
     job_dir = _job_dir()
     out_tmpl = os.path.join(job_dir, "file.%(ext)s")
     ydl_opts = {
+        **_base_opts(),
         "outtmpl": out_tmpl,
         "quiet": True,
         "no_warnings": True,

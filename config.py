@@ -31,3 +31,9 @@ PORT = int(os.environ.get("PORT", 10000))
 # dashboard has no authentication and anyone with the URL could control
 # the bot (skip/stop/pause). Leave unset only for local testing.
 DASHBOARD_TOKEN = os.environ.get("DASHBOARD_TOKEN", "")
+
+# --- YouTube cookies (optional but usually required on cloud hosts) ---
+# YouTube increasingly demands "sign in to confirm you're not a bot" for
+# requests from datacenter IPs like Render's. Point this at a cookies.txt
+# exported from a real logged-in browser session to fix it. See README.
+COOKIES_FILE = os.environ.get("COOKIES_FILE", "")

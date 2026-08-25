@@ -5,12 +5,12 @@ Two jobs at once:
 1. Render (and most PaaS "web service" tiers) expect the process to bind
    a port and answer HTTP requests, or the deploy eventually times out —
    even though the bot itself works fine via Telegram long-polling.
-2. Gives you a simple page to see what's queued/playing and control it
-   without needing to be in the Telegram chat.
+2. Gives you a simple page to add media, see what's queued/playing, and
+   control it, without needing to be in the Telegram chat.
 
 Runs in a background thread (Flask's dev server is fine for this scale);
-coroutines it needs to trigger (pause/skip/etc.) are handed off to the
-bot's asyncio event loop via run_coroutine_threadsafe.
+coroutines it needs to trigger (pause/skip/add/etc.) are handed off to
+the bot's asyncio event loop via run_coroutine_threadsafe.
 """
 import asyncio
 import logging
@@ -18,7 +18,7 @@ import logging
 from flask import Flask, request, redirect, url_for, abort
 
 from config import DASHBOARD_TOKEN, PORT
-from queue_manager import queue
+from queue_manager import queue, MediaType
 
 log = logging.getLogger("dashboard")
 
@@ -29,7 +29,7 @@ app = Flask(__name__)
 _loop_ref = {"loop": None}
 # Set by bot.py so the dashboard can call back into bot.py without a
 # circular import at module load time.
-_hooks = {"advance_and_play": None, "get_bot": None}
+_hooks = {"advance_and_play": None, "enqueue_url": None, "get_bot": None}
 
 
 def _run_coro(coro):
@@ -70,18 +70,42 @@ PAGE = """
     .now {{ border: 1px solid #3b82f6; }}
     .title {{ font-weight: 600; }}
     .meta {{ color: #999; font-size: 13px; margin-top: 4px; }}
-    .btns a {{ display: inline-block; margin-top: 10px; margin-right: 8px; padding: 8px 14px; background: #3b82f6; color: white; border-radius: 8px; text-decoration: none; font-size: 14px; }}
-    .btns a.danger {{ background: #ef4444; }}
-    .queue-item {{ padding: 8px 0; border-bottom: 1px solid #2a2a2e; font-size: 14px; }}
+    .btns a, .btns button {{ display: inline-block; margin-top: 10px; margin-right: 8px; padding: 8px 14px; background: #3b82f6; color: white; border: none; border-radius: 8px; text-decoration: none; font-size: 14px; cursor: pointer; font-family: inherit; }}
+    .btns a.danger, .btns button.danger {{ background: #ef4444; }}
+    .queue-item {{ display: flex; align-items: center; justify-content: space-between; padding: 8px 0; border-bottom: 1px solid #2a2a2e; font-size: 14px; }}
+    .queue-item a {{ color: #ef4444; text-decoration: none; font-size: 13px; margin-left: 12px; flex-shrink: 0; }}
     .empty {{ color: #777; }}
+    form.add {{ display: flex; gap: 8px; flex-wrap: wrap; }}
+    form.add input[type=text] {{ flex: 1; min-width: 200px; padding: 9px 12px; border-radius: 8px; border: 1px solid #333; background: #111; color: #eee; font-size: 14px; }}
+    form.add select {{ padding: 9px 8px; border-radius: 8px; border: 1px solid #333; background: #111; color: #eee; font-size: 14px; }}
+    form.add button {{ padding: 9px 16px; border-radius: 8px; border: none; background: #22c55e; color: white; font-size: 14px; cursor: pointer; }}
   </style>
 </head>
 <body>
   <h1>🎧 VC Stream Bot</h1>
+
+  <div class="card">
+    <div class="title" style="margin-bottom:10px;">Add to queue</div>
+    <form class="add" method="post" action="/control/add{t}">
+      <input type="text" name="url" placeholder="Paste a YouTube / file link" required>
+      <select name="type">
+        <option value="video">Video</option>
+        <option value="audio">Audio only</option>
+        <option value="file">Direct file</option>
+      </select>
+      <button type="submit">Add</button>
+    </form>
+  </div>
+
   {now_playing}
+
   <div class="card">
     <div class="title">Queue ({count})</div>
     {queue_list}
+    <div class="btns">
+      <a href="/control/skip{t}">⏭ Skip</a>
+      <a href="/control/stop{t}" class="danger">🛑 End VC</a>
+    </div>
   </div>
 </body>
 </html>
@@ -103,8 +127,6 @@ def dashboard():
           <div class="btns">
             <a href="/control/pause{t}">Pause</a>
             <a href="/control/resume{t}">Resume</a>
-            <a href="/control/skip{t}">Skip</a>
-            <a href="/control/stop{t}" class="danger">End VC</a>
           </div>
         </div>
         """
@@ -115,17 +137,45 @@ def dashboard():
         rows = ""
         for i, it in enumerate(queue.items):
             marker = "▶️ " if i == queue.current_index else f"{i + 1}. "
-            rows += f'<div class="queue-item">{marker}{it.title} [{_fmt(it.duration)}]</div>'
+            remove_link = f'<a href="/control/remove/{it.id}{t}">remove</a>'
+            rows += f'<div class="queue-item"><span>{marker}{it.title} [{_fmt(it.duration)}]</span>{remove_link}</div>'
     else:
         rows = '<div class="empty">Empty.</div>'
 
-    return PAGE.format(now_playing=now_playing, count=len(queue.items), queue_list=rows)
+    return PAGE.format(now_playing=now_playing, count=len(queue.items), queue_list=rows, t=t)
 
 
 @app.route("/health")
 def health():
     # Plain health-check for Render's port scan — no token required.
     return {"status": "ok"}
+
+
+@app.route("/control/add", methods=["POST"])
+def control_add():
+    _check_token()
+    url = (request.form.get("url") or "").strip()
+    type_str = request.form.get("type", "video")
+    media_type = {"video": MediaType.VIDEO, "audio": MediaType.AUDIO, "file": MediaType.FILE}.get(type_str, MediaType.VIDEO)
+
+    enqueue = _hooks["enqueue_url"]
+    if url and enqueue:
+        _run_coro(enqueue(url, media_type))
+
+    return redirect(url_for("dashboard", token=request.args.get("token")))
+
+
+@app.route("/control/remove/<int:item_id>")
+def control_remove(item_id):
+    _check_token()
+    from downloader import cleanup_job
+    target = next((i for i in queue.items if i.id == item_id), None)
+    # Don't allow deleting the currently-playing item this way — use Skip
+    # instead, since it also needs to stop/replace the live stream.
+    if target and target is not queue.current:
+        queue.remove(item_id)
+        cleanup_job(target.filepath)
+    return redirect(url_for("dashboard", token=request.args.get("token")))
 
 
 @app.route("/control/pause")
@@ -168,8 +218,9 @@ def control_stop():
     return redirect(url_for("dashboard", token=request.args.get("token")))
 
 
-def run(loop, advance_and_play_fn, get_bot_fn):
+def run(loop, advance_and_play_fn, enqueue_url_fn, get_bot_fn):
     _loop_ref["loop"] = loop
     _hooks["advance_and_play"] = advance_and_play_fn
+    _hooks["enqueue_url"] = enqueue_url_fn
     _hooks["get_bot"] = get_bot_fn
     app.run(host="0.0.0.0", port=PORT, debug=False, use_reloader=False)

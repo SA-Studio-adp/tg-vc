@@ -89,6 +89,54 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+DOWNLOADER_BY_TYPE = {
+    MediaType.VIDEO: download_youtube_video,
+    MediaType.AUDIO: download_youtube_music,
+    MediaType.FILE: download_direct_file,
+}
+
+
+async def _enqueue_url(url: str, media_type: MediaType, requested_by: int = 0):
+    """Bot-agnostic enqueue: downloads, adds to queue, and starts playback
+    if the queue was empty. Used by both Telegram commands and the web
+    dashboard's Add form. Posts status updates to CHAT_ID rather than
+    replying to a specific message, since callers may not have one."""
+    bot = _app_ref["app"].bot if _app_ref["app"] else None
+    downloader_fn = DOWNLOADER_BY_TYPE[media_type]
+
+    try:
+        result = await downloader_fn(url)
+    except Exception as e:
+        if bot:
+            await bot.send_message(chat_id=CHAT_ID, text=f"❌ Download failed: {e}")
+        return
+
+    item = QueueItem(
+        title=result.title, url=url, media_type=media_type,
+        requested_by=requested_by, filepath=result.filepath,
+        duration=result.duration,
+    )
+    was_empty = queue.current is None
+    queue.add(item)
+    if was_empty:
+        queue.current_index = 0
+        try:
+            await _play_item(item)
+        except Exception as e:
+            queue.clear()
+            cleanup_job(item.filepath)
+            if bot:
+                await bot.send_message(chat_id=CHAT_ID, text=f"❌ Couldn't start the stream: {e}")
+            return
+        if bot:
+            await bot.send_message(chat_id=CHAT_ID, text=f"▶️ Now streaming: {item.title} [{fmt_duration(item.duration)}]")
+    else:
+        if bot:
+            await bot.send_message(chat_id=CHAT_ID, text=f"✅ Added to queue (position {len(queue.items)}): {item.title}")
+
+    return item
+
+
 async def _enqueue(update, context, url, media_type, downloader_fn):
     if not await guard(update):
         return
@@ -249,7 +297,7 @@ async def _post_init(app: Application):
     loop = asyncio.get_running_loop()
     threading.Thread(
         target=web_dashboard.run,
-        args=(loop, _advance_and_play, lambda: _app_ref["app"].bot if _app_ref["app"] else None),
+        args=(loop, _advance_and_play, _enqueue_url, lambda: _app_ref["app"].bot if _app_ref["app"] else None),
         daemon=True,
     ).start()
     log.info("Dashboard starting on port %s", web_dashboard.PORT if hasattr(web_dashboard, "PORT") else "?")
