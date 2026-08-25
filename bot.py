@@ -1,29 +1,20 @@
-import os
-import io
+import asyncio
 import logging
-import requests
-from telegram import (
-    Update, InputFile, InlineKeyboardButton, InlineKeyboardMarkup
-)
-from telegram.ext import (
-    Application, CommandHandler, CallbackQueryHandler, ContextTypes
-)
-from telegram.constants import ParseMode
 
-from config import BOT_TOKEN, CHANNEL_ID, ADMIN_IDS, MAX_UPLOAD_MB, DOWNLOAD_DIR
+from telegram import Update
+from telegram.ext import Application, CommandHandler, ContextTypes
+
+from config import BOT_TOKEN, ADMIN_IDS, CHAT_ID
 from downloader import (
     download_youtube_video, download_youtube_music, download_direct_file,
-    trim_clip, probe_duration, cleanup_job
+    cleanup_job,
 )
-from queue_manager import get_queue, QueueItem, MediaType
+from queue_manager import queue, QueueItem, MediaType
+import vc_player
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-log = logging.getLogger("ytbot")
+log = logging.getLogger("vcbot")
 
-MAX_BYTES = MAX_UPLOAD_MB * 1024 * 1024
-
-
-# ---------- helpers ----------
 
 def is_admin(user_id: int) -> bool:
     return user_id in ADMIN_IDS
@@ -36,87 +27,6 @@ def fmt_duration(seconds: float) -> str:
     return f"{h:02d}:{m:02d}:{s:02d}" if h else f"{m:02d}:{s:02d}"
 
 
-def player_caption(item: QueueItem, queue) -> str:
-    status = "▶️ Playing" if queue.is_playing else "⏸ Paused"
-    pos = fmt_duration(item.elapsed)
-    dur = fmt_duration(item.duration)
-    upcoming = ""
-    if queue.has_next():
-        nxt = queue.items[queue.current_index + 1]
-        upcoming = f"\n\n<b>⏭ Up next:</b> {nxt.title}"
-    return (
-        f"<b>{item.title}</b>\n"
-        f"{status}   {pos} / {dur}\n"
-        f"Queue position: {queue.current_index + 1}/{len(queue.items)}"
-        f"{upcoming}"
-    )
-
-
-def player_keyboard(item: QueueItem, queue) -> InlineKeyboardMarkup:
-    play_pause = "⏸ Pause" if queue.is_playing else "▶️ Play"
-    rows = [
-        [
-            InlineKeyboardButton("⏪ -5s", callback_data=f"seek:-5:{item.id}"),
-            InlineKeyboardButton(play_pause, callback_data=f"toggle:{item.id}"),
-            InlineKeyboardButton("+5s ⏩", callback_data=f"seek:5:{item.id}"),
-        ],
-        [
-            InlineKeyboardButton("⏭ Play Next", callback_data=f"next:{item.id}"),
-            InlineKeyboardButton("🗑 Remove", callback_data=f"remove:{item.id}"),
-        ],
-    ]
-    return InlineKeyboardMarkup(rows)
-
-
-def download_thumb_bytes(thumb_url: str):
-    if not thumb_url:
-        return None
-    try:
-        r = requests.get(thumb_url, timeout=15)
-        r.raise_for_status()
-        return io.BytesIO(r.content)
-    except Exception as e:
-        log.warning(f"thumbnail fetch failed: {e}")
-        return None
-
-
-async def send_player_card(context: ContextTypes.DEFAULT_TYPE, chat_id, item: QueueItem, queue):
-    """Uploads the media file to the channel with embedded thumbnail,
-    title/status caption, and the control-panel buttons underneath."""
-    thumb = download_thumb_bytes(item.thumbnail_url)
-    caption = player_caption(item, queue)
-    kb = player_keyboard(item, queue)
-
-    with open(item.filepath, "rb") as f:
-        if item.media_type == MediaType.AUDIO:
-            msg = await context.bot.send_audio(
-                chat_id=chat_id, audio=InputFile(f, filename=os.path.basename(item.filepath)),
-                thumbnail=thumb, caption=caption, parse_mode=ParseMode.HTML,
-                duration=int(item.duration), reply_markup=kb,
-            )
-        else:
-            msg = await context.bot.send_video(
-                chat_id=chat_id, video=InputFile(f, filename=os.path.basename(item.filepath)),
-                thumbnail=thumb, caption=caption, parse_mode=ParseMode.HTML,
-                duration=int(item.duration), supports_streaming=True, reply_markup=kb,
-            )
-    item.message_id = msg.message_id
-    return msg
-
-
-async def refresh_player_card(context: ContextTypes.DEFAULT_TYPE, chat_id, item: QueueItem, queue):
-    try:
-        await context.bot.edit_message_caption(
-            chat_id=chat_id, message_id=item.message_id,
-            caption=player_caption(item, queue), parse_mode=ParseMode.HTML,
-            reply_markup=player_keyboard(item, queue),
-        )
-    except Exception as e:
-        log.warning(f"could not refresh card: {e}")
-
-
-# ---------- command handlers ----------
-
 async def guard(update: Update) -> bool:
     user = update.effective_user
     if not user or not is_admin(user.id):
@@ -125,24 +35,61 @@ async def guard(update: Update) -> bool:
     return True
 
 
+# ---------- playback control ----------
+
+async def _play_item(item: QueueItem):
+    """Actually starts streaming `item` into the voice chat."""
+    is_video = item.media_type == MediaType.VIDEO
+    await vc_player.play(item.filepath, is_video=is_video)
+    queue.is_playing = True
+
+
+async def _advance_and_play(bot):
+    """Cleans up the item that just finished and starts the next one, if any."""
+    old = queue.current
+    nxt = queue.advance()
+    if old:
+        cleanup_job(old.filepath)
+    if nxt:
+        await _play_item(nxt)
+        try:
+            await bot.send_message(
+                chat_id=CHAT_ID,
+                text=f"▶️ Now streaming: <b>{nxt.title}</b> [{fmt_duration(nxt.duration)}]",
+                parse_mode="HTML",
+            )
+        except Exception:
+            pass
+    else:
+        await vc_player.leave()
+        try:
+            await bot.send_message(chat_id=CHAT_ID, text="⏹ Queue finished — left the voice chat.")
+        except Exception:
+            pass
+    return nxt
+
+
+# ---------- commands ----------
+
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "👋 <b>YT Channel Player Bot</b>\n\n"
-        "<b>/yt &lt;url&gt;</b> — queue a YouTube video\n"
-        "<b>/ytm &lt;url&gt;</b> — queue YouTube Music / audio\n"
-        "<b>/files &lt;url&gt;</b> — queue a direct audio/video file link\n"
-        "<b>/queue</b> — show the current queue\n"
-        "<b>/skip</b> — skip to the next item\n"
-        "<b>/clear</b> — clear the queue\n",
-        parse_mode=ParseMode.HTML,
+        "👋 <b>VC Stream Bot</b>\n\n"
+        "<b>/vplay &lt;url&gt;</b> — queue + stream a YouTube video into the VC\n"
+        "<b>/vplaym &lt;url&gt;</b> — queue + stream YouTube Music / audio\n"
+        "<b>/vfile &lt;url&gt;</b> — queue + stream a direct file link\n"
+        "<b>/vqueue</b> — show the current queue\n"
+        "<b>/vpause</b> / <b>/vresume</b> — real pause/resume in the VC\n"
+        "<b>/vskip</b> — skip to the next item\n"
+        "<b>/vstop</b> — clear queue and leave the VC\n",
+        parse_mode="HTML",
     )
 
 
-async def _enqueue_and_maybe_play(update, context, url, media_type, downloader_fn):
+async def _enqueue(update, context, url, media_type, downloader_fn):
     if not await guard(update):
         return
     if not url:
-        await update.message.reply_text("Usage: send a link after the command, e.g.\n/yt https://youtube.com/watch?v=...")
+        await update.message.reply_text("Usage: send a link after the command, e.g.\n/vplay https://youtube.com/watch?v=...")
         return
 
     status_msg = await update.message.reply_text("⏳ Downloading…")
@@ -152,51 +99,52 @@ async def _enqueue_and_maybe_play(update, context, url, media_type, downloader_f
         await status_msg.edit_text(f"❌ Download failed: {e}")
         return
 
-    size = os.path.getsize(result.filepath)
-    if size > MAX_BYTES:
-        await status_msg.edit_text(
-            f"❌ File is {size / 1024 / 1024:.1f}MB, over the {MAX_UPLOAD_MB}MB bot upload limit.\n"
-            f"Run a local Bot API server for up to 2GB uploads (see README)."
-        )
-        cleanup_job(result.filepath)
-        return
-
-    queue = get_queue(update.effective_chat.id)
     item = QueueItem(
         title=result.title, url=url, media_type=media_type,
         requested_by=update.effective_user.id, filepath=result.filepath,
-        thumbnail_url=result.thumbnail_url, duration=result.duration or probe_duration(result.filepath),
+        duration=result.duration,
     )
     was_empty = queue.current is None
     queue.add(item)
+    if was_empty:
+        queue.current_index = 0
 
     if was_empty:
-        await status_msg.edit_text("📤 Uploading & starting playback…")
-        await send_player_card(context, CHANNEL_ID, item, queue)
-        await status_msg.delete()
+        await status_msg.edit_text("🔊 Joining voice chat & starting stream…")
+        try:
+            await _play_item(item)
+        except Exception as e:
+            await status_msg.edit_text(
+                f"❌ Couldn't start the stream: {e}\n\n"
+                f"Make sure the userbot account is a member of the group and "
+                f"a voice chat is active (or can be auto-started)."
+            )
+            queue.clear()
+            cleanup_job(item.filepath)
+            return
+        await status_msg.edit_text(f"▶️ Now streaming: {item.title} [{fmt_duration(item.duration)}]")
     else:
         await status_msg.edit_text(f"✅ Added to queue (position {len(queue.items)}): {item.title}")
 
 
-async def cmd_yt(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def cmd_vplay(update: Update, context: ContextTypes.DEFAULT_TYPE):
     url = " ".join(context.args) if context.args else None
-    await _enqueue_and_maybe_play(update, context, url, MediaType.VIDEO, download_youtube_video)
+    await _enqueue(update, context, url, MediaType.VIDEO, download_youtube_video)
 
 
-async def cmd_ytm(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def cmd_vplaym(update: Update, context: ContextTypes.DEFAULT_TYPE):
     url = " ".join(context.args) if context.args else None
-    await _enqueue_and_maybe_play(update, context, url, MediaType.AUDIO, download_youtube_music)
+    await _enqueue(update, context, url, MediaType.AUDIO, download_youtube_music)
 
 
-async def cmd_files(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def cmd_vfile(update: Update, context: ContextTypes.DEFAULT_TYPE):
     url = " ".join(context.args) if context.args else None
-    await _enqueue_and_maybe_play(update, context, url, MediaType.FILE, download_direct_file)
+    await _enqueue(update, context, url, MediaType.FILE, download_direct_file)
 
 
-async def cmd_queue(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def cmd_vqueue(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await guard(update):
         return
-    queue = get_queue(update.effective_chat.id)
     if not queue.items:
         await update.message.reply_text("Queue is empty.")
         return
@@ -207,92 +155,91 @@ async def cmd_queue(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("\n".join(lines))
 
 
-async def cmd_skip(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def cmd_vpause(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await guard(update):
         return
-    await _advance(context, update.effective_chat.id)
+    if not queue.current:
+        await update.message.reply_text("Nothing is playing.")
+        return
+    await vc_player.pause()
+    queue.is_playing = False
+    await update.message.reply_text("⏸ Paused.")
 
 
-async def cmd_clear(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def cmd_vresume(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await guard(update):
         return
-    get_queue(update.effective_chat.id).clear()
-    await update.message.reply_text("🗑 Queue cleared.")
-
-
-# ---------- button callbacks ----------
-
-async def _advance(context, chat_id):
-    queue = get_queue(chat_id)
-    old = queue.current
-    nxt = queue.next()
-    if old:
-        cleanup_job(old.filepath)
-    if nxt:
-        await send_player_card(context, CHANNEL_ID, nxt, queue)
-    return nxt
-
-
-async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    user = update.effective_user
-    if not is_admin(user.id):
-        await query.answer("🚫 Admins only.", show_alert=True)
+    if not queue.current:
+        await update.message.reply_text("Nothing is playing.")
         return
+    await vc_player.resume()
+    queue.is_playing = True
+    await update.message.reply_text("▶️ Resumed.")
 
-    action, *rest = query.data.split(":")
-    chat_id = CHANNEL_ID
-    queue = get_queue(chat_id)
-    item = queue.current
 
-    if action == "toggle":
-        queue.is_playing = not queue.is_playing
-        await query.answer("Paused" if not queue.is_playing else "Playing")
-        if item:
-            await refresh_player_card(context, chat_id, item, queue)
+async def cmd_vskip(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await guard(update):
+        return
+    if not queue.current:
+        await update.message.reply_text("Nothing is playing.")
+        return
+    await update.message.reply_text("⏭ Skipping…")
+    await _advance_and_play(context.bot)
 
-    elif action == "next":
-        await query.answer("Skipping…")
-        await _advance(context, chat_id)
 
-    elif action == "remove":
-        item_id = int(rest[1]) if len(rest) > 1 else int(rest[0])
-        queue.remove(item_id)
-        await query.answer("Removed from queue")
+async def cmd_vstop(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await guard(update):
+        return
+    for it in queue.items:
+        cleanup_job(it.filepath)
+    queue.clear()
+    await vc_player.leave()
+    await update.message.reply_text("🛑 Stopped and left the voice chat.")
 
-    elif action == "seek":
-        delta = int(rest[0])
-        if not item:
-            await query.answer("Nothing playing")
-            return
-        new_pos = max(0, item.elapsed + delta)
-        item.elapsed = new_pos
-        await query.answer(f"Seeking to {fmt_duration(new_pos)}…")
-        try:
-            clip_path = trim_clip(item.filepath, new_pos, "mp4")
-            with open(clip_path, "rb") as f:
-                if item.media_type == MediaType.AUDIO:
-                    await context.bot.send_audio(chat_id=chat_id, audio=InputFile(f), caption=f"⏩ Resumed at {fmt_duration(new_pos)}")
-                else:
-                    await context.bot.send_video(chat_id=chat_id, video=InputFile(f), caption=f"⏩ Resumed at {fmt_duration(new_pos)}", supports_streaming=True)
-            os.remove(clip_path)
-        except Exception as e:
-            log.warning(f"seek failed: {e}")
-            await context.bot.send_message(chat_id=chat_id, text="⚠️ Seek failed — ffmpeg couldn't trim this file.")
-        await refresh_player_card(context, chat_id, item, queue)
+
+# ---------- stream-end wiring ----------
+
+async def _on_stream_end():
+    """Called by vc_player when ffmpeg/py-tgcalls reports the current
+    stream finished — auto-advances the queue."""
+    app = _app_ref["app"]
+    if app is None:
+        return
+    await _advance_and_play(app.bot)
+
+
+_app_ref = {"app": None}
+
+
+async def _post_init(app: Application):
+    _app_ref["app"] = app
+    vc_player.on_stream_end_callback = _on_stream_end
+    await vc_player.start()
+    log.info("VC player started, userbot connected")
+
+
+async def _post_shutdown(app: Application):
+    await vc_player.stop()
 
 
 def main():
-    app = Application.builder().token(BOT_TOKEN).build()
+    app = (
+        Application.builder()
+        .token(BOT_TOKEN)
+        .post_init(_post_init)
+        .post_shutdown(_post_shutdown)
+        .build()
+    )
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_start))
-    app.add_handler(CommandHandler("yt", cmd_yt))
-    app.add_handler(CommandHandler("ytm", cmd_ytm))
-    app.add_handler(CommandHandler("files", cmd_files))
-    app.add_handler(CommandHandler("queue", cmd_queue))
-    app.add_handler(CommandHandler("skip", cmd_skip))
-    app.add_handler(CommandHandler("clear", cmd_clear))
-    app.add_handler(CallbackQueryHandler(on_button))
+    app.add_handler(CommandHandler("vplay", cmd_vplay))
+    app.add_handler(CommandHandler("vplaym", cmd_vplaym))
+    app.add_handler(CommandHandler("vfile", cmd_vfile))
+    app.add_handler(CommandHandler("vqueue", cmd_vqueue))
+    app.add_handler(CommandHandler("vpause", cmd_vpause))
+    app.add_handler(CommandHandler("vresume", cmd_vresume))
+    app.add_handler(CommandHandler("vskip", cmd_vskip))
+    app.add_handler(CommandHandler("vstop", cmd_vstop))
     log.info("Bot starting…")
     app.run_polling()
 

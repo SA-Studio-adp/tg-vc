@@ -3,15 +3,20 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-BOT_TOKEN = os.getenv("BOT_TOKEN", "8893555718:AAGtJPHfYXXOFTfD9NF5tBXbnT7uTh9O8aI")
-CHANNEL_ID = os.getenv("CHANNEL_ID", "-1004408283215")
-ADMIN_IDS = {int(x) for x in os.getenv("ADMIN_IDS", "7990681306").split(",") if x.strip().isdigit()}
-MAX_UPLOAD_MB = int(os.getenv("MAX_UPLOAD_MB", "50"))
-DOWNLOAD_DIR = os.getenv("DOWNLOAD_DIR", "downloads")
+# --- Bot (for commands) ---
+BOT_TOKEN = os.environ["BOT_TOKEN"]
 
+# --- Userbot (for actually streaming into the voice chat) ---
+API_ID = int(os.environ["API_ID"])
+API_HASH = os.environ["API_HASH"]
+SESSION_STRING = os.environ["SESSION_STRING"]
+
+# The group whose voice chat we stream into.
+# Must be a group (not a channel) with an active or startable voice chat,
+# and the userbot account must already be a member of it.
+CHAT_ID = int(os.environ["CHAT_ID"])
+
+ADMIN_IDS = {int(x) for x in os.environ.get("ADMIN_IDS", "").split(",") if x.strip()}
+
+DOWNLOAD_DIR = os.environ.get("DOWNLOAD_DIR", "downloads")
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
-
-if not BOT_TOKEN:
-    raise RuntimeError("BOT_TOKEN missing — copy .env.example to .env and fill it in.")
-if not CHANNEL_ID:
-    raise RuntimeError("CHANNEL_ID missing — copy .env.example to .env and fill it in.")
