@@ -57,11 +57,30 @@ python bot.py
 - `/vqueue` — show the queue
 - `/vpause` / `/vresume` — real pause/resume in the voice chat
 - `/vskip` — skip to the next item
-- `/vstop` — clear the queue and leave the voice chat
+- `/vstop` — clear the queue and **end** the voice chat (not just leave it —
+  `close=True` actually discards the call for everyone)
+
+The bot's `/` command menu in Telegram clients is synced automatically on
+every startup from the list in `bot.py` (`BOT_COMMANDS`) — no need to
+manually edit anything via @BotFather when you add or rename a command.
 
 Unlike the old channel-post version, pause/resume here are **real** —
 py-tgcalls actually pauses the live stream rather than just relabeling a
 sent message.
+
+## Web dashboard
+The bot also runs a small web page (on `$PORT`) showing what's queued and
+currently playing, with Pause / Resume / Skip / End VC buttons. This is
+also what satisfies Render's "web service" requirement of binding a port —
+without it, Render eventually times out the deploy even though the bot
+itself is working fine over Telegram long-polling.
+
+Set `DASHBOARD_TOKEN` in your env vars and open:
+```
+https://your-render-url.onrender.com/?token=your_token
+```
+Without a token set, the dashboard is unauthenticated — fine for local
+testing, not recommended once deployed publicly.
 
 ## Notes / limitations
 - Single voice chat at a time (`CHAT_ID` in config) — this isn't a

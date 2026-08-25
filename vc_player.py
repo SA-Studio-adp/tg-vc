@@ -44,13 +44,13 @@ async def start():
 
 
 async def stop():
-    await calls.leave_call(CHAT_ID) if await _in_call() else None
+    await end_call() if await _in_call() else None
     await pyro_client.stop()
 
 
 async def _in_call() -> bool:
     try:
-        active = await calls.calls()
+        active = await calls.calls  # async property, not a method
         return CHAT_ID in active
     except Exception:
         return False
@@ -76,9 +76,11 @@ async def resume():
     await calls.resume(CHAT_ID)
 
 
-async def leave():
+async def end_call():
+    """Fully ends the voice chat for everyone (close=True), rather than
+    just having the userbot step out of an otherwise still-active call."""
     if await _in_call():
-        await calls.leave_call(CHAT_ID)
+        await calls.leave_call(CHAT_ID, close=True)
 
 
 async def current_position() -> float:

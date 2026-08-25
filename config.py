@@ -20,3 +20,14 @@ ADMIN_IDS = {int(x) for x in os.environ.get("ADMIN_IDS", "").split(",") if x.str
 
 DOWNLOAD_DIR = os.environ.get("DOWNLOAD_DIR", "downloads")
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
+
+# --- Web dashboard ---
+# Render (and most "web service" hosting tiers) expect the process to
+# bind a port, or the deploy is eventually killed even if the bot itself
+# is working fine via long-polling. This also doubles as the requested
+# "home page" to view/control the queue from a browser.
+PORT = int(os.environ.get("PORT", 10000))
+# Set this to something secret in your env vars — without it the
+# dashboard has no authentication and anyone with the URL could control
+# the bot (skip/stop/pause). Leave unset only for local testing.
+DASHBOARD_TOKEN = os.environ.get("DASHBOARD_TOKEN", "")

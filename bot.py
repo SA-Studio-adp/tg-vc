@@ -1,7 +1,8 @@
 import asyncio
 import logging
+import threading
 
-from telegram import Update
+from telegram import Update, BotCommand
 from telegram.ext import Application, CommandHandler, ContextTypes
 
 from config import BOT_TOKEN, ADMIN_IDS, CHAT_ID
@@ -11,6 +12,7 @@ from downloader import (
 )
 from queue_manager import queue, QueueItem, MediaType
 import vc_player
+import web_dashboard
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("vcbot")
@@ -61,9 +63,9 @@ async def _advance_and_play(bot):
         except Exception:
             pass
     else:
-        await vc_player.leave()
+        await vc_player.end_call()
         try:
-            await bot.send_message(chat_id=CHAT_ID, text="⏹ Queue finished — left the voice chat.")
+            await bot.send_message(chat_id=CHAT_ID, text="⏹ Queue finished — voice chat ended.")
         except Exception:
             pass
     return nxt
@@ -80,7 +82,9 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "<b>/vqueue</b> — show the current queue\n"
         "<b>/vpause</b> / <b>/vresume</b> — real pause/resume in the VC\n"
         "<b>/vskip</b> — skip to the next item\n"
-        "<b>/vstop</b> — clear queue and leave the VC\n",
+        "<b>/vstop</b> — clear queue and end the VC\n\n"
+        "There's also a web dashboard for controlling playback from a browser — "
+        "ask whoever deployed the bot for the link.",
         parse_mode="HTML",
     )
 
@@ -193,8 +197,8 @@ async def cmd_vstop(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for it in queue.items:
         cleanup_job(it.filepath)
     queue.clear()
-    await vc_player.leave()
-    await update.message.reply_text("🛑 Stopped and left the voice chat.")
+    await vc_player.end_call()
+    await update.message.reply_text("🛑 Stopped and ended the voice chat.")
 
 
 # ---------- stream-end wiring ----------
@@ -211,11 +215,44 @@ async def _on_stream_end():
 _app_ref = {"app": None}
 
 
+BOT_COMMANDS = [
+    BotCommand("vplay", "Queue + stream a YouTube video into the VC"),
+    BotCommand("vplaym", "Queue + stream YouTube Music / audio"),
+    BotCommand("vfile", "Queue + stream a direct file link"),
+    BotCommand("vqueue", "Show the current queue"),
+    BotCommand("vpause", "Pause the stream"),
+    BotCommand("vresume", "Resume the stream"),
+    BotCommand("vskip", "Skip to the next item"),
+    BotCommand("vstop", "Clear queue and end the voice chat"),
+    BotCommand("help", "Show this bot's commands"),
+]
+
+
 async def _post_init(app: Application):
     _app_ref["app"] = app
     vc_player.on_stream_end_callback = _on_stream_end
     await vc_player.start()
     log.info("VC player started, userbot connected")
+
+    # "Auto command updation": pushes the command list to Telegram every
+    # startup, so the / menu in clients always matches what's in this
+    # file — no manual editing via @BotFather needed.
+    try:
+        await app.bot.set_my_commands(BOT_COMMANDS)
+        log.info("Command menu synced with Telegram")
+    except Exception as e:
+        log.warning(f"Could not sync command menu: {e}")
+
+    # Dashboard runs in its own thread since Flask's dev server is
+    # blocking; hand it the running event loop so its HTTP handlers can
+    # safely schedule coroutines back onto it.
+    loop = asyncio.get_running_loop()
+    threading.Thread(
+        target=web_dashboard.run,
+        args=(loop, _advance_and_play, lambda: _app_ref["app"].bot if _app_ref["app"] else None),
+        daemon=True,
+    ).start()
+    log.info("Dashboard starting on port %s", web_dashboard.PORT if hasattr(web_dashboard, "PORT") else "?")
 
 
 async def _post_shutdown(app: Application):
