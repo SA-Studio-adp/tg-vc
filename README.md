@@ -90,6 +90,38 @@ https://your-render-url.onrender.com/?token=your_token
 Without a token set, the dashboard is unauthenticated — fine for local
 testing, not recommended once deployed publicly.
 
+## Deploying on Render (Docker)
+This repo includes a `Dockerfile` that packages the bot together with a
+local **PO token server** (`bgutil-ytdlp-pot-provider`) in one container —
+this is the main fix for YouTube's "Sign in to confirm you're not a bot"
+on datacenter IPs like Render's, on top of cookies.
+
+1. Push this repo to GitHub (with the `Dockerfile`).
+2. On Render: **New → Web Service** → connect the repo → set
+   **Runtime: Docker** (Render auto-detects the `Dockerfile`).
+3. Add your env vars from `.env.example` (`BOT_TOKEN`, `API_ID`,
+   `API_HASH`, `SESSION_STRING`, `CHAT_ID`, `ADMIN_IDS`,
+   `DASHBOARD_TOKEN`) under **Environment**. Don't set `PORT` — Render
+   sets it automatically. Don't set `POT_PROVIDER_BASE_URL` — the
+   Dockerfile sets it to the in-container token server already.
+4. (Strongly recommended) Add `COOKIES_FILE` via **Secret Files** as
+   described below — PO tokens help a lot, but cookies from a real
+   logged-in session still matter for consistency over time.
+5. Deploy. First build takes a few extra minutes since it compiles the
+   Node-based token server — that's expected.
+
+If the token server fails to start for any reason, `start.sh` logs a
+warning and starts the bot anyway; downloads just fall back to
+cookies-only behavior rather than the whole deploy failing.
+
+**Keeping it working long-term:** this is a moving target on YouTube's
+side. Every so often:
+```
+pip install -U yt-dlp bgutil-ytdlp-pot-provider
+```
+and bump `ARG BGUTIL_VERSION` in the `Dockerfile` to match the current
+`bgutil-ytdlp-pot-provider` release, then redeploy.
+
 ## Fixing YouTube's "Sign in to confirm you're not a bot" / "The page needs to be reloaded" errors
 Both of these come from the same underlying situation: YouTube periodically
 changes its player JavaScript, and yt-dlp has to keep up. When yt-dlp falls
