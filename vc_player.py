@@ -58,11 +58,31 @@ async def _in_call() -> bool:
 
 async def play(filepath: str, is_video: bool, start_seconds: float = 0.0):
     """(Re)joins the VC if needed and streams `filepath` from the start,
-    or from `start_seconds` in when used for seeking."""
+    or from `start_seconds` in when used for seeking.
+
+    AUTO_DETECT runs pytgcalls' own internal probe of the file to decide
+    whether to negotiate a video track at all, which is a *separate*
+    check from the one downloader.py already did — the two can
+    disagree, and AUTO_DETECT silently falling back to audio-only is
+    the most common cause of "I can only hear it, not see it" even
+    when the downloaded file genuinely has a video stream. REQUIRED
+    forces the video track to be negotiated since we already know the
+    file has one, and raises an error instead of silently dropping to
+    audio-only if pytgcalls' own ffmpeg probe still can't find video.
+
+    video_parameters is left at its library default (VideoQuality.HD_720p)
+    — no need to construct one manually.
+
+    NOTE: even with this fixed, Telegram's voice-chat UI shows viewers
+    the audio-avatar view by default — they need to tap the video icon
+    in the voice chat panel to switch to "Watch"/grid view. That's a
+    client-side UX default, not a bug, and is worth checking first if
+    "no video" reports keep coming in after this fix.
+    """
     ffmpeg_params = f"-ss {start_seconds}" if start_seconds else None
     stream = MediaStream(
         filepath,
-        video_flags=MediaStream.Flags.IGNORE if not is_video else MediaStream.Flags.AUTO_DETECT,
+        video_flags=MediaStream.Flags.REQUIRED if is_video else MediaStream.Flags.IGNORE,
         ffmpeg_parameters=ffmpeg_params,
     )
     await calls.play(CHAT_ID, stream)

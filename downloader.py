@@ -49,10 +49,15 @@ from config import DOWNLOAD_DIR, COOKIES_FILE
 
 log = logging.getLogger(__name__)
 
-# Try to import the PO token plugin. It self-registers with yt-dlp on
-# import (that's how yt-dlp plugins work) — we don't call it directly.
+# Try to detect the PO token plugin. It does NOT install a top-level
+# `bgutil_ytdlp_pot_provider` module — it installs into yt-dlp's own
+# plugin-discovery namespace at `yt_dlp_plugins/extractor/`, which
+# yt-dlp scans automatically. We just check that namespace is present
+# and importable; we never call it directly (yt-dlp does that itself
+# once the extractor_args below point it at the token server).
 try:
-    import bgutil_ytdlp_pot_provider  # noqa: F401
+    import importlib
+    importlib.import_module("yt_dlp_plugins.extractor.getpot_bgutil_http")
     _POT_PROVIDER_AVAILABLE = True
 except ImportError:
     _POT_PROVIDER_AVAILABLE = False
