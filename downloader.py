@@ -2,20 +2,37 @@
 Downloads YouTube video / audio (and generic direct links) via yt-dlp,
 producing a local file that pytgcalls' ffmpeg pipeline can stream from.
 
-YouTube periodically changes its player JavaScript, which breaks yt-dlp's
-signature decryption until yt-dlp catches up (this is an ongoing, known
-arms race — see e.g. https://github.com/yt-dlp/yt-dlp/issues/17405).
-Two symptoms of this:
-  - "The page needs to be reloaded." errors
-  - Silently downloading an audio-only stream when video was requested,
-    because video formats need signature decryption and audio ones don't,
-    so a broad format fallback can quietly "succeed" with audio only.
+=== 2026 UPDATE: PO Token requirement ===
+Through 2026, YouTube expanded its bot-detection so that most player
+clients (not just 'web') now require a PO Token (Proof of Origin token)
+alongside cookies. Without one, extraction fails with "Sign in to
+confirm you're not a bot" or "The page needs to be reloaded" even with
+valid, fresh cookies. This is the most common cause of that error today.
 
-Mitigations here: try multiple YouTube player clients in order (some
-don't need JS signature solving at all), validate the downloaded file
-actually contains a video stream when one was requested, and use ffprobe
-as an authoritative fallback for duration when yt-dlp's own metadata is
-incomplete.
+Fix strategy here:
+  1. Wire in the `bgutil-ytdlp-pot-provider` plugin, which runs a small
+     local token-generation service yt-dlp calls automatically. Optional
+     but strongly recommended — see README setup steps below.
+  2. Widen the player-client fallback list. Different clients have
+     different PO token requirements; trying several in order means one
+     client failing doesn't sink the whole download.
+  3. Validate the downloaded file actually contains a video stream when
+     one was requested (unchanged from before) — a broad format
+     fallback can quietly "succeed" with audio only.
+  4. Check the installed yt-dlp version on startup and warn loudly if
+     it's stale, since this extractor code ages out within weeks.
+
+=== Setup for PO token support (recommended) ===
+  pip install -U bgutil-ytdlp-pot-provider
+  # This plugin needs a small companion HTTP server (Node-based) to
+  # actually generate tokens. Run it once, e.g. via Docker:
+  #   docker run -d -p 4416:4416 brainicism/bgutil-ytdlp-pot-provider
+  # Then set POT_PROVIDER_BASE_URL=http://127.0.0.1:4416 in your env
+  # (see config.py). If unset, yt-dlp just runs without PO tokens,
+  # same as before — this is additive, not required to boot.
+
+See also: https://github.com/yt-dlp/yt-dlp/issues/17405 (ongoing arms
+race tracking issue) and https://github.com/Brainicism/bgutil-ytdlp-pot-provider
 """
 import os
 import re
@@ -23,20 +40,75 @@ import uuid
 import shutil
 import asyncio
 import subprocess
+import logging
+from importlib.metadata import version as _pkg_version, PackageNotFoundError
+
 import yt_dlp
 
 from config import DOWNLOAD_DIR, COOKIES_FILE
 
-# Player clients to try, in order. 'tv' is deliberately excluded: it
-# authenticates differently from a normal browser session, and pairing
-# it with cookies can invalidate the cookie session entirely rather than
-# helping — a known yt-dlp/YouTube interaction, not a hypothetical.
-# 'android' generally avoids the JS signature-solving issues that cause
-# "page needs to be reloaded"; 'web' is kept as the client cookies work
-# best with, for the "sign in to confirm" bot-check specifically.
-YT_PLAYER_CLIENTS = "android,web"
+log = logging.getLogger(__name__)
+
+# Try to import the PO token plugin. It self-registers with yt-dlp on
+# import (that's how yt-dlp plugins work) — we don't call it directly.
+try:
+    import bgutil_ytdlp_pot_provider  # noqa: F401
+    _POT_PROVIDER_AVAILABLE = True
+except ImportError:
+    _POT_PROVIDER_AVAILABLE = False
+
+POT_PROVIDER_BASE_URL = os.environ.get("POT_PROVIDER_BASE_URL", "").strip()
+
+# Player clients to try, in order. Widened from the original android/web
+# pair because different clients hit different PO token requirements —
+# if one client's token requirement isn't satisfiable in your setup, the
+# next one in line may not need a token at all, or needs a different kind.
+#   - android: usually fine without a token for a while, but has been
+#     increasingly gated through 2026; kept first since it's cheapest
+#     when it works.
+#   - ios: historically slow to get token-gated, good fallback.
+#   - web_safari: separate token pool from plain 'web', sometimes works
+#     when 'web' is rate-limited or blocked.
+#   - web: kept last — most reliable WITH cookies + PO token, but the
+#     most bot-detection-scrutinized client when those aren't present.
+# 'tv' remains excluded: pairing it with cookies can invalidate the
+# cookie session entirely rather than helping (known yt-dlp/YouTube
+# interaction).
+YT_PLAYER_CLIENTS = "android,ios,web_safari,web"
 
 _URL_RE = re.compile(r"^https?://", re.IGNORECASE)
+
+_MIN_YTDLP_VERSION = "2026.7.4"  # bump this periodically; see README
+
+
+def _check_ytdlp_version():
+    """Fails loudly and specifically instead of letting a stale yt-dlp
+    produce a confusing 'sign in to confirm' error that looks like a
+    cookie/token problem when it's really just an outdated extractor."""
+    try:
+        installed = _pkg_version("yt-dlp")
+    except PackageNotFoundError:
+        log.warning("Could not determine installed yt-dlp version.")
+        return
+    if installed < _MIN_YTDLP_VERSION:
+        log.warning(
+            "yt-dlp %s is older than the recommended minimum %s. YouTube's "
+            "extractor breaks frequently — if downloads are failing, run "
+            "`pip install -U yt-dlp` before investigating anything else.",
+            installed, _MIN_YTDLP_VERSION,
+        )
+
+
+_check_ytdlp_version()
+
+if not _POT_PROVIDER_AVAILABLE:
+    log.info(
+        "bgutil-ytdlp-pot-provider not installed — running without PO token "
+        "support. YouTube may block downloads with 'Sign in to confirm "
+        "you're not a bot' regardless of cookies. Install it and run the "
+        "companion server for the most reliable downloads (see top of "
+        "this file for setup)."
+    )
 
 
 class DownloadError(Exception):
@@ -82,11 +154,24 @@ def _get_writable_cookies_file():
 
 def _base_opts() -> dict:
     """Options shared by every yt-dlp call."""
+    extractor_args = {"youtube": {"player_client": [YT_PLAYER_CLIENTS]}}
+
+    if POT_PROVIDER_BASE_URL:
+        # Tells the bgutil plugin where its companion token-server lives.
+        extractor_args["youtubepot-bgutilhttp"] = {
+            "base_url": [POT_PROVIDER_BASE_URL]
+        }
+
     opts = {
         "quiet": True,
         "no_warnings": True,
         "noplaylist": True,
-        "extractor_args": {"youtube": {"player_client": [YT_PLAYER_CLIENTS]}},
+        "extractor_args": extractor_args,
+        # A stale cached player-JS/signature timestamp is another common,
+        # quiet cause of "page needs to be reloaded" — force a re-fetch
+        # rather than trusting a cache that may predate YouTube's latest
+        # player change.
+        "cachedir": False,
     }
     cookies_path = _get_writable_cookies_file()
     if cookies_path:
@@ -177,6 +262,39 @@ def _resolve_duration(filepath: str, ytdlp_duration) -> float:
     return _ffprobe_duration(filepath)
 
 
+def _friendly_blocked_message() -> str:
+    tips = [
+        "YouTube is blocking this download from this server (their side, "
+        "not yours). This has gotten stricter through 2026 — cookies alone "
+        "don't always clear it anymore; a 'proof of origin' (PO) token is "
+        "often required too.",
+    ]
+    if not _POT_PROVIDER_AVAILABLE:
+        tips.append(
+            "PO token support isn't installed on this server — that's "
+            "likely the actual cause. Run: pip install -U "
+            "bgutil-ytdlp-pot-provider, start its companion server, and "
+            "set POT_PROVIDER_BASE_URL. See the top of downloader.py for "
+            "the exact steps."
+        )
+    elif not POT_PROVIDER_BASE_URL:
+        tips.append(
+            "bgutil-ytdlp-pot-provider is installed but POT_PROVIDER_BASE_URL "
+            "isn't set, so it's not actually being used. Set it to your "
+            "running companion server's URL (e.g. http://127.0.0.1:4416)."
+        )
+    else:
+        tips.append(
+            "PO token support is configured — if it's still failing, "
+            "confirm the companion token server is actually running and "
+            "reachable at POT_PROVIDER_BASE_URL, and that COOKIES_FILE "
+            "points to fresh, currently-valid cookies (re-export them; "
+            "expired cookies fail the same way as missing ones)."
+        )
+    tips.append("Also keep yt-dlp updated: pip install -U yt-dlp.")
+    return " ".join(tips)
+
+
 def _run_ytdlp(url: str, audio_only: bool) -> DownloadResult:
     _validate_url(url)
     job_dir = _job_dir()
@@ -218,16 +336,7 @@ def _run_ytdlp(url: str, audio_only: bool) -> DownloadResult:
     except yt_dlp.utils.DownloadError as e:
         msg = str(e)
         if "reloaded" in msg.lower() or "sign in" in msg.lower():
-            raise DownloadError(
-                "YouTube is blocking this download from this server (their "
-                "side, not yours). This has gotten stricter through 2026 — "
-                "cookies alone don't always clear it anymore; a 'proof of "
-                "origin' token is often required now too. Make sure "
-                "COOKIES_FILE is set with fresh cookies, keep yt-dlp updated "
-                "(pip install -U yt-dlp), and see the README's YouTube "
-                "section for current details — this is an active arms race "
-                "that changes over time."
-            )
+            raise DownloadError(_friendly_blocked_message())
         raise DownloadError(msg)
 
     if not audio_only:
