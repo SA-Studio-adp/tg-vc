@@ -27,11 +27,14 @@ import yt_dlp
 
 from config import DOWNLOAD_DIR, COOKIES_FILE
 
-# Player clients to try, in order. android/tv clients generally don't
-# require the JS-based signature solving that breaks when YouTube ships
-# a player update yt-dlp hasn't caught up with yet; web is kept last as
-# a broad-compatibility fallback.
-YT_PLAYER_CLIENTS = "android,tv,web"
+# Player clients to try, in order. 'tv' is deliberately excluded: it
+# authenticates differently from a normal browser session, and pairing
+# it with cookies can invalidate the cookie session entirely rather than
+# helping — a known yt-dlp/YouTube interaction, not a hypothetical.
+# 'android' generally avoids the JS signature-solving issues that cause
+# "page needs to be reloaded"; 'web' is kept as the client cookies work
+# best with, for the "sign in to confirm" bot-check specifically.
+YT_PLAYER_CLIENTS = "android,web"
 
 _URL_RE = re.compile(r"^https?://", re.IGNORECASE)
 
@@ -216,10 +219,14 @@ def _run_ytdlp(url: str, audio_only: bool) -> DownloadResult:
         msg = str(e)
         if "reloaded" in msg.lower() or "sign in" in msg.lower():
             raise DownloadError(
-                "YouTube is currently blocking this download (their side, not "
-                "yours — a known, ongoing issue with YouTube's player changes). "
-                "Try again in a bit, make sure yt-dlp is updated to the latest "
-                "version, and check that COOKIES_FILE is set and valid."
+                "YouTube is blocking this download from this server (their "
+                "side, not yours). This has gotten stricter through 2026 — "
+                "cookies alone don't always clear it anymore; a 'proof of "
+                "origin' token is often required now too. Make sure "
+                "COOKIES_FILE is set with fresh cookies, keep yt-dlp updated "
+                "(pip install -U yt-dlp), and see the README's YouTube "
+                "section for current details — this is an active arms race "
+                "that changes over time."
             )
         raise DownloadError(msg)
 
