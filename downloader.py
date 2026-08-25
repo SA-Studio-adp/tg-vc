@@ -4,6 +4,7 @@ producing a local file that pytgcalls' ffmpeg pipeline can stream from.
 """
 import os
 import uuid
+import shutil
 import asyncio
 import yt_dlp
 
@@ -24,14 +25,37 @@ def _job_dir():
     return d
 
 
+_writable_cookies_path = None
+
+
+def _get_writable_cookies_file():
+    """yt-dlp opens the cookie file in a mode that can write updated
+    session cookies back to it. Render's Secret Files (and similar
+    read-only mounts) reject that with 'Read-only file system', even
+    though reading works fine. Fix: copy it once to a writable location
+    and use that copy from then on."""
+    global _writable_cookies_path
+    if not COOKIES_FILE or not os.path.isfile(COOKIES_FILE):
+        return None
+    if _writable_cookies_path and os.path.isfile(_writable_cookies_path):
+        return _writable_cookies_path
+
+    os.makedirs(DOWNLOAD_DIR, exist_ok=True)
+    dest = os.path.join(DOWNLOAD_DIR, "cookies.txt")
+    shutil.copyfile(COOKIES_FILE, dest)
+    _writable_cookies_path = dest
+    return dest
+
+
 def _base_opts() -> dict:
     """Options shared by every yt-dlp call, notably cookies — YouTube
     frequently demands "sign in to confirm you're not a bot" for requests
     coming from datacenter IPs (e.g. Render's), and cookies from a real
     logged-in session are the standard fix."""
     opts = {}
-    if COOKIES_FILE and os.path.isfile(COOKIES_FILE):
-        opts["cookiefile"] = COOKIES_FILE
+    cookies_path = _get_writable_cookies_file()
+    if cookies_path:
+        opts["cookiefile"] = cookies_path
     return opts
 
 
