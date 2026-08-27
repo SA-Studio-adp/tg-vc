@@ -87,6 +87,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "<b>/rtplay &lt;url&gt;</b> — stream a YouTube video via RTMP push "
         "instead (alternative engine — try if /vplay's video won't show; "
         "no pause/resume/seek on this path, just play/stop)\n"
+        "<b>/rtfile &lt;url&gt;</b> — stream a direct file link via RTMP push\n"
         "<b>/rtstop</b> — stop the RTMP stream\n\n"
         "There's also a web dashboard for controlling playback from a browser — "
         "ask whoever deployed the bot for the link.",
@@ -262,29 +263,43 @@ async def cmd_vstop(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # queue models would be misleading. One RTMP item plays at a time;
 # use /rtplay again to switch to a different video.
 
-async def cmd_rtplay(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def _rtmp_enqueue(update: Update, context: ContextTypes.DEFAULT_TYPE, downloader_fn, usage: str):
+    """Shared by /rtplay and /rtfile: download via `downloader_fn`, then
+    start the RTMP push. Kept as one helper so both commands' error
+    handling/messaging stay identical."""
     if not await guard(update):
         return
     url = " ".join(context.args) if context.args else None
     if not url:
-        await update.message.reply_text("Usage: /rtplay <youtube url>")
+        await update.message.reply_text(f"Usage: {usage}")
         return
 
     status_msg = await update.message.reply_text("⏳ Downloading…")
     try:
-        result = await download_youtube_video(url)
+        result = await downloader_fn(url)
     except Exception as e:
         await status_msg.edit_text(f"❌ Download failed: {e}")
         return
 
     await status_msg.edit_text("📡 Starting RTMP stream to the video chat…")
     try:
+        # delete_when_done=True (the default) removes the downloaded
+        # file automatically once ffmpeg finishes pushing it — no
+        # separate cleanup step needed here.
         await rtmp_streamer.start_stream(result.filepath)
     except Exception as e:
         await status_msg.edit_text(f"❌ Couldn't start the RTMP stream: {e}")
         cleanup_job(result.filepath)
         return
-    await status_msg.edit_text(f"▶️ Streaming via RTMP: {result.title} [{fmt_duration(result.duration)}]")
+    await status_msg.edit_text(f"▶️ Streaming via RTMP: {result.title} [{fmt_duration(result.duration)}]\n(file will be auto-deleted once the stream ends)")
+
+
+async def cmd_rtplay(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await _rtmp_enqueue(update, context, download_youtube_video, "/rtplay <youtube url>")
+
+
+async def cmd_rtfile(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await _rtmp_enqueue(update, context, download_direct_file, "/rtfile <direct file url>")
 
 
 async def cmd_rtstop(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -321,6 +336,7 @@ BOT_COMMANDS = [
     BotCommand("vskip", "Skip to the next item"),
     BotCommand("vstop", "Clear queue and end the voice chat"),
     BotCommand("rtplay", "Stream a YouTube video via RTMP push"),
+    BotCommand("rtfile", "Stream a direct file link via RTMP push"),
     BotCommand("rtstop", "Stop the RTMP stream"),
     BotCommand("help", "Show this bot's commands"),
 ]
@@ -380,6 +396,7 @@ def main():
     app.add_handler(CommandHandler("vskip", cmd_vskip))
     app.add_handler(CommandHandler("vstop", cmd_vstop))
     app.add_handler(CommandHandler("rtplay", cmd_rtplay))
+    app.add_handler(CommandHandler("rtfile", cmd_rtfile))
     app.add_handler(CommandHandler("rtstop", cmd_rtstop))
     log.info("Bot starting…")
     app.run_polling()

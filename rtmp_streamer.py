@@ -46,6 +46,7 @@ from pyrogram.raw.functions.phone import (
 from pyrogram.raw.types import InputGroupCall
 
 from config import API_ID, API_HASH, SESSION_STRING, CHAT_ID
+from downloader import cleanup_job
 
 log = logging.getLogger("rtmp_streamer")
 
@@ -119,11 +120,18 @@ async def _ensure_rtmp_call() -> InputGroupCall:
     return _active_call
 
 
-async def start_stream(filepath: str, loop: bool = False):
+async def start_stream(filepath: str, loop: bool = False, delete_when_done: bool = True):
     """Starts pushing `filepath` into the group's video chat over RTMP.
     Stops any stream already in progress first. Set loop=True to repeat
     the file indefinitely (ffmpeg -stream_loop -1) until stop_stream()
     is called — useful for a single background/holding video.
+
+    delete_when_done=True (the default) removes `filepath`'s job
+    directory once ffmpeg exits, however it exits — finished naturally,
+    errored out, or was stopped via stop_stream()/end_call(). Pass
+    False if you're intentionally reusing the same file across multiple
+    start_stream() calls (e.g. a persistent loop=True holding video)
+    and don't want it deleted out from under a later restart.
     """
     await stop_stream()  # clean slate; also frees the previous ffmpeg proc
 
@@ -157,12 +165,16 @@ async def start_stream(filepath: str, loop: bool = False):
         stderr=asyncio.subprocess.PIPE,
     )
     log.info("ffmpeg RTMP push started for %s (pid %s)", filepath, _ffmpeg_proc.pid)
-    asyncio.create_task(_watch_ffmpeg(_ffmpeg_proc, filepath))
+    asyncio.create_task(_watch_ffmpeg(_ffmpeg_proc, filepath, delete_when_done))
 
 
-async def _watch_ffmpeg(proc: asyncio.subprocess.Process, filepath: str):
-    """Waits for ffmpeg to exit (end of file, or error) and logs stderr
-    on non-zero exit so RTMP rejection reasons aren't silently lost."""
+async def _watch_ffmpeg(proc: asyncio.subprocess.Process, filepath: str, delete_when_done: bool):
+    """Waits for ffmpeg to exit (end of file, error, or an explicit
+    stop) and logs stderr on non-zero exit so RTMP rejection reasons
+    aren't silently lost. Deletes the source file's job directory
+    afterward when delete_when_done is set, regardless of which of
+    those three ways it exited — matches vc_player/queue_manager's
+    existing "cleanup once a file is done being streamed" behavior."""
     _, stderr = await proc.communicate()
     if proc.returncode not in (0, None, -signal.SIGTERM):
         log.error(
@@ -171,6 +183,9 @@ async def _watch_ffmpeg(proc: asyncio.subprocess.Process, filepath: str):
         )
     else:
         log.info("ffmpeg RTMP push for %s finished normally", filepath)
+    if delete_when_done:
+        cleanup_job(filepath)
+        log.info("Deleted %s after RTMP stream ended", filepath)
     if _on_finished_callback and proc is _ffmpeg_proc:
         await _on_finished_callback()
 
