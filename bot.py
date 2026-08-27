@@ -12,6 +12,7 @@ from downloader import (
 )
 from queue_manager import queue, QueueItem, MediaType
 import vc_player
+import rtmp_streamer
 import web_dashboard
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -83,6 +84,10 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "<b>/vpause</b> / <b>/vresume</b> — real pause/resume in the VC\n"
         "<b>/vskip</b> — skip to the next item\n"
         "<b>/vstop</b> — clear queue and end the VC\n\n"
+        "<b>/rtplay &lt;url&gt;</b> — stream a YouTube video via RTMP push "
+        "instead (alternative engine — try if /vplay's video won't show; "
+        "no pause/resume/seek on this path, just play/stop)\n"
+        "<b>/rtstop</b> — stop the RTMP stream\n\n"
         "There's also a web dashboard for controlling playback from a browser — "
         "ask whoever deployed the bot for the link.",
         parse_mode="HTML",
@@ -249,6 +254,49 @@ async def cmd_vstop(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("🛑 Stopped and ended the voice chat.")
 
 
+# ---------- RTMP streaming (alternative to /vplay) ----------
+#
+# Separate command family, not merged into the /vplay queue: RTMP push
+# doesn't support real pause/resume/seek the way the pytgcalls path
+# does (see rtmp_streamer.py's module docstring), so mixing the two
+# queue models would be misleading. One RTMP item plays at a time;
+# use /rtplay again to switch to a different video.
+
+async def cmd_rtplay(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await guard(update):
+        return
+    url = " ".join(context.args) if context.args else None
+    if not url:
+        await update.message.reply_text("Usage: /rtplay <youtube url>")
+        return
+
+    status_msg = await update.message.reply_text("⏳ Downloading…")
+    try:
+        result = await download_youtube_video(url)
+    except Exception as e:
+        await status_msg.edit_text(f"❌ Download failed: {e}")
+        return
+
+    await status_msg.edit_text("📡 Starting RTMP stream to the video chat…")
+    try:
+        await rtmp_streamer.start_stream(result.filepath)
+    except Exception as e:
+        await status_msg.edit_text(f"❌ Couldn't start the RTMP stream: {e}")
+        cleanup_job(result.filepath)
+        return
+    await status_msg.edit_text(f"▶️ Streaming via RTMP: {result.title} [{fmt_duration(result.duration)}]")
+
+
+async def cmd_rtstop(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await guard(update):
+        return
+    if not rtmp_streamer.is_streaming():
+        await update.message.reply_text("Nothing is RTMP-streaming right now.")
+        return
+    await rtmp_streamer.end_call()
+    await update.message.reply_text("🛑 Stopped the RTMP stream and ended the video chat.")
+
+
 # ---------- stream-end wiring ----------
 
 async def _on_stream_end():
@@ -272,6 +320,8 @@ BOT_COMMANDS = [
     BotCommand("vresume", "Resume the stream"),
     BotCommand("vskip", "Skip to the next item"),
     BotCommand("vstop", "Clear queue and end the voice chat"),
+    BotCommand("rtplay", "Stream a YouTube video via RTMP push"),
+    BotCommand("rtstop", "Stop the RTMP stream"),
     BotCommand("help", "Show this bot's commands"),
 ]
 
@@ -281,6 +331,9 @@ async def _post_init(app: Application):
     vc_player.on_stream_end_callback = _on_stream_end
     await vc_player.start()
     log.info("VC player started, userbot connected")
+
+    await rtmp_streamer.start_bot()
+    log.info("RTMP streamer started, userbot connected")
 
     # "Auto command updation": pushes the command list to Telegram every
     # startup, so the / menu in clients always matches what's in this
@@ -305,6 +358,7 @@ async def _post_init(app: Application):
 
 async def _post_shutdown(app: Application):
     await vc_player.stop()
+    await rtmp_streamer.stop_bot()
 
 
 def main():
@@ -325,6 +379,8 @@ def main():
     app.add_handler(CommandHandler("vresume", cmd_vresume))
     app.add_handler(CommandHandler("vskip", cmd_vskip))
     app.add_handler(CommandHandler("vstop", cmd_vstop))
+    app.add_handler(CommandHandler("rtplay", cmd_rtplay))
+    app.add_handler(CommandHandler("rtstop", cmd_rtstop))
     log.info("Bot starting…")
     app.run_polling()
 
