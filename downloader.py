@@ -44,6 +44,7 @@ import logging
 from importlib.metadata import version as _pkg_version, PackageNotFoundError
 
 import yt_dlp
+import requests
 
 from config import DOWNLOAD_DIR, COOKIES_FILE
 
@@ -130,11 +131,20 @@ class DownloadError(Exception):
 
 
 class DownloadResult:
-    def __init__(self, filepath, title, duration, thumbnail_url=None):
+    def __init__(self, filepath, title, duration, thumbnail_url=None,
+                 is_video=True, cover_path=None):
         self.filepath = filepath
         self.title = title
         self.duration = duration  # seconds
         self.thumbnail_url = thumbnail_url
+        # is_video=False means this is an audio-only file — the RTMP
+        # layer needs a static image to pair with it (see cover_path).
+        self.is_video = is_video
+        # Local path to a still image to display while streaming an
+        # audio-only file: embedded cover art for direct-link audio, or
+        # the downloaded YouTube thumbnail for /vplaym. None means no
+        # art was available — rtmp_streamer falls back to a black frame.
+        self.cover_path = cover_path
 
 
 def _job_dir():
@@ -275,6 +285,49 @@ def _resolve_duration(filepath: str, ytdlp_duration) -> float:
     return _ffprobe_duration(filepath)
 
 
+def _extract_embedded_cover(filepath: str) -> str | None:
+    """Extracts embedded cover art (the same "video" stream ffprobe
+    reports for an mp3/m4a/flac's ID3 APIC tag — see _IMAGE_CODECS)
+    to a standalone jpg alongside the source file, for use as the
+    static video frame when RTMP-streaming an audio-only file. Returns
+    None if extraction fails or the file has no embedded art at all
+    (rtmp_streamer falls back to a black frame in that case)."""
+    job_dir = os.path.dirname(filepath)
+    cover_path = os.path.join(job_dir, "cover.jpg")
+    try:
+        subprocess.run(
+            ["ffmpeg", "-y", "-i", filepath, "-an", "-map", "0:v:0",
+             "-frames:v", "1", cover_path],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            check=True, timeout=15,
+        )
+        if os.path.isfile(cover_path) and os.path.getsize(cover_path) > 0:
+            return cover_path
+    except Exception:
+        pass
+    return None
+
+
+def _download_thumbnail(url: str, job_dir: str) -> str | None:
+    """Downloads a thumbnail URL (yt-dlp's info['thumbnail'] for
+    /vplaym) to a local jpg for the same purpose as
+    _extract_embedded_cover — a static frame for audio-only RTMP
+    streaming. Separate from the embedded-art path because YouTube
+    audio (converted to opus) has no embedded picture stream of its
+    own; the thumbnail is the only art available for it."""
+    if not url:
+        return None
+    try:
+        resp = requests.get(url, timeout=10)
+        resp.raise_for_status()
+        cover_path = os.path.join(job_dir, "cover.jpg")
+        with open(cover_path, "wb") as f:
+            f.write(resp.content)
+        return cover_path
+    except Exception:
+        return None
+
+
 def _friendly_blocked_message() -> str:
     tips = [
         "YouTube is blocking this download from this server (their side, "
@@ -371,11 +424,20 @@ def _run_ytdlp(url: str, audio_only: bool) -> DownloadResult:
     duration = _resolve_duration(filepath, info.get("duration"))
     title = info.get("title") or os.path.splitext(os.path.basename(filepath))[0]
 
+    cover_path = None
+    if audio_only:
+        # YouTube audio has no embedded picture stream of its own (it's
+        # a fresh opus re-encode) — use the video's thumbnail instead so
+        # /vplaym still shows real cover art rather than a black frame.
+        cover_path = _download_thumbnail(info.get("thumbnail"), job_dir)
+
     return DownloadResult(
         filepath=filepath,
         title=title,
         duration=duration,
         thumbnail_url=info.get("thumbnail"),
+        is_video=not audio_only,
+        cover_path=cover_path,
     )
 
 
@@ -405,23 +467,35 @@ def _run_direct_download(url: str) -> DownloadResult:
     # Generic/CDN links (as opposed to sites yt-dlp has a dedicated
     # extractor for) sometimes serve a preview thumbnail instead of the
     # actual media — same codec_type=video as real footage, but a static
-    # image. Reject that clearly instead of silently streaming a frozen
-    # square thumbnail on loop.
-    if not _has_any_video_stream(filepath) and not _ffprobe_has_audio(filepath):
+    # image, with no audio either. Reject THAT clearly.
+    #
+    # Careful distinction from a genuinely playable audio file: ffprobe
+    # reports an mp3/m4a/flac's embedded cover art (ID3 APIC tag) the
+    # exact same way — codec_type=video, codec_name=mjpeg/png — even
+    # though the file is perfectly playable audio. The old version of
+    # this check treated "has an image-coded video stream" as an error
+    # on its own, which misfired on exactly that case (cover art +
+    # real audio) and rejected legitimate audio files. The fix: only
+    # treat it as the CDN-preview-thumbnail failure case when there's
+    # NO real audio either — i.e. truly nothing playable came through.
+    has_real_video = _has_real_video_stream(filepath)
+    has_audio = _ffprobe_has_audio(filepath)
+
+    if not has_real_video and not has_audio:
         cleanup_job(filepath)
         raise DownloadError(
             "That link didn't resolve to a playable audio/video file — "
             "double check it's a direct link to the actual media, not a "
-            "webpage or preview link."
+            "webpage or preview link (or, if it's an image URL, that's "
+            "expected to fail — this bot streams audio/video, not stills)."
         )
-    if _has_any_video_stream(filepath) and not _has_real_video_stream(filepath):
-        cleanup_job(filepath)
-        raise DownloadError(
-            "That link resolved to a static image, not a real video — "
-            "this can happen with CDN/link-shortener URLs that serve a "
-            "preview thumbnail instead of the actual file. Double check "
-            "the link points straight at the video/audio file itself."
-        )
+
+    cover_path = None
+    if not has_real_video:
+        # Audio-only (has_audio is True here, or the check above would
+        # have already raised) — grab embedded cover art if there is
+        # any; rtmp_streamer falls back to a black frame if not.
+        cover_path = _extract_embedded_cover(filepath)
 
     duration = _resolve_duration(filepath, info.get("duration"))
     # Generic extractors on CDN/link-forwarding sites often have no real
@@ -439,6 +513,8 @@ def _run_direct_download(url: str) -> DownloadResult:
         title=title,
         duration=duration,
         thumbnail_url=info.get("thumbnail"),
+        is_video=has_real_video,
+        cover_path=cover_path,
     )
 
 

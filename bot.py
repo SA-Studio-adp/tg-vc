@@ -47,9 +47,11 @@ async def guard(update: Update) -> bool:
 # below are otherwise unchanged in shape from before.
 
 async def _play_item(item: QueueItem):
-    """Actually starts streaming `item` into the video chat."""
-    is_video = item.media_type != MediaType.AUDIO
-    await rtmp_streamer.play(item.filepath, is_video=is_video)
+    """Actually starts streaming `item` into the video chat. Uses the
+    content kind detected at download time (item.is_video/cover_path)
+    rather than guessing from media_type — a /vfile link can turn out
+    to be audio-only regardless of which command fetched it."""
+    await rtmp_streamer.play(item.filepath, is_video=item.is_video, cover_path=item.cover_path)
     queue.is_playing = True
 
 
@@ -124,6 +126,7 @@ async def _enqueue_url(url: str, media_type: MediaType, requested_by: int = 0):
         title=result.title, url=url, media_type=media_type,
         requested_by=requested_by, filepath=result.filepath,
         duration=result.duration,
+        is_video=result.is_video, cover_path=result.cover_path,
     )
     was_empty = queue.current is None
     queue.add(item)
@@ -164,6 +167,7 @@ async def _enqueue(update, context, url, media_type, downloader_fn):
         title=result.title, url=url, media_type=media_type,
         requested_by=update.effective_user.id, filepath=result.filepath,
         duration=result.duration,
+        is_video=result.is_video, cover_path=result.cover_path,
     )
     was_empty = queue.current is None
     queue.add(item)

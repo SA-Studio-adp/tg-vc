@@ -24,6 +24,14 @@ class QueueItem:
     requested_by: int
     filepath: Optional[str] = None
     duration: float = 0.0
+    # Actual detected content kind (from downloader.py's ffprobe check),
+    # not just guessed from media_type — a /vfile link can turn out to
+    # be audio-only (e.g. an mp3) even though MediaType.FILE doesn't
+    # say so by itself. cover_path is a still image to loop as video
+    # when is_video is False (embedded cover art or a thumbnail); None
+    # means rtmp_streamer falls back to a black frame.
+    is_video: bool = True
+    cover_path: Optional[str] = None
     id: int = field(default_factory=lambda: next(_id_counter))
 
 

@@ -7,13 +7,15 @@ dialog), so there's no client-side WebRTC video-track negotiation for
 a library to get wrong — that negotiation is what was silently
 falling back to audio-only before.
 
-=== Audio-only items (/vplaym) ===
+=== Audio-only items (/vplaym, /vfile on an audio file) ===
 The group call here is created as an RTMP-source *video* chat, and
 Telegram's RTMP ingest expects a video track — there's no "radio mode"
-toggle the way pytgcalls' Flags.IGNORE offered. Audio-only files are
-paired with a synthesized static black frame (ffmpeg `lavfi color`
-source) so /vplaym still works without the person requesting music
-needing to know it's technically a silent black video underneath.
+toggle the way pytgcalls' Flags.IGNORE offered. downloader.py detects
+whether a download is actually audio-only (via ffprobe) regardless of
+which command was used, and supplies a still image to loop as the
+video track: embedded cover art for direct-link audio files, or the
+downloaded YouTube thumbnail for /vplaym. Falls back to a synthesized
+black frame only when no art is available.
 
 === Soft pause/resume ===
 RTMP push has no native pause. pause() SIGTERMs ffmpeg after recording
@@ -72,6 +74,7 @@ _active_call: InputGroupCall | None = None
 _ffmpeg_proc: asyncio.subprocess.Process | None = None
 _current_filepath: str | None = None
 _current_is_video: bool = True
+_current_cover_path: str | None = None         # static image for audio-only items, if one was extracted/downloaded
 _elapsed_before_current_segment: float = 0.0   # seconds already played, across any prior pause(s)
 _segment_started_at: float | None = None       # time.monotonic() when the currently-running ffmpeg segment began
 _suppress_finish_callback: bool = False
@@ -137,24 +140,37 @@ async def _ensure_rtmp_call() -> InputGroupCall:
     return _active_call
 
 
-def _build_ffmpeg_cmd(filepath: str, is_video: bool, rtmp_target: str, resume_seconds: float) -> list:
+def _build_ffmpeg_cmd(filepath: str, is_video: bool, rtmp_target: str,
+                       resume_seconds: float, cover_path: str | None = None) -> list:
     cmd = ["ffmpeg", "-hide_banner", "-loglevel", "warning"]
-    if resume_seconds > 0:
-        # Input-side seek: fast, close enough for this use case (no
-        # need for output-side frame-accurate seeking here).
-        cmd += ["-ss", f"{resume_seconds:.2f}"]
+    # -ss must sit immediately before the -i of the file it seeks —
+    # ffmpeg scopes it to that one input, not every input that follows.
+    # Placed globally at the front (the earlier version of this
+    # function did that) it silently seeks the WRONG input whenever
+    # there's a second one ahead of the real media (cover image /
+    # black-frame source) — meaning /vresume would restart audio-only
+    # items from 0:00 instead of the paused position. Built as its own
+    # list here and inserted right before the actual media file's -i
+    # in every branch, so it always seeks the right thing.
+    seek = ["-ss", f"{resume_seconds:.2f}"] if resume_seconds > 0 else []
 
     if is_video:
-        cmd += ["-re", "-i", filepath]
+        cmd += [*seek, "-re", "-i", filepath]
         video_map, audio_map = ["-map", "0:v:0"], ["-map", "0:a:0?"]
+    elif cover_path:
+        # Audio-only source with real cover art (embedded ID3 art, or
+        # the downloaded YouTube thumbnail): loop the still image as
+        # the video track instead of a black frame. -shortest trims
+        # the (infinite) looped image down to the audio's actual
+        # length.
+        cmd += ["-loop", "1", "-framerate", "25", "-i", cover_path]
+        cmd += [*seek, "-re", "-i", filepath]
+        video_map, audio_map = ["-map", "0:v:0"], ["-map", "1:a:0?"]
+        cmd += ["-shortest"]
     else:
-        # Audio-only source: pair with a synthetic black frame — see
-        # module docstring. -shortest trims the (infinite) lavfi video
-        # source down to the audio's actual length.
-        cmd += [
-            "-f", "lavfi", "-i", "color=c=black:s=1280x720:r=25",
-            "-re", "-i", filepath,
-        ]
+        # No cover art available — fall back to a synthetic black frame.
+        cmd += ["-f", "lavfi", "-i", "color=c=black:s=1280x720:r=25"]
+        cmd += [*seek, "-re", "-i", filepath]
         video_map, audio_map = ["-map", "0:v:0"], ["-map", "1:a:0?"]
         cmd += ["-shortest"]
 
@@ -162,6 +178,7 @@ def _build_ffmpeg_cmd(filepath: str, is_video: bool, rtmp_target: str, resume_se
         *video_map, *audio_map,
         "-c:v", "libx264", "-preset", "veryfast", "-b:v", "2500k",
         "-g", "60", "-keyint_min", "60",  # ~2s keyframe interval at 30fps — Telegram's RTMP ingest expects steady keyframes
+        "-pix_fmt", "yuv420p",  # still-image inputs default to yuvj420p, which some RTMP receivers reject
         "-c:a", "aac", "-b:a", "128k", "-ar", "44100",
         "-f", "flv", rtmp_target,
     ]
@@ -208,10 +225,13 @@ async def _watch_ffmpeg(proc: asyncio.subprocess.Process, filepath: str):
         await on_finished_callback()
 
 
-async def play(filepath: str, is_video: bool, resume_seconds: float = 0.0):
+async def play(filepath: str, is_video: bool, resume_seconds: float = 0.0, cover_path: str | None = None):
     """Starts (or restarts) the RTMP push for `filepath`. Named `play`
-    to match the old vc_player.play() call shape in bot.py."""
-    global _ffmpeg_proc, _current_filepath, _current_is_video
+    to match the old vc_player.play() call shape in bot.py.
+    cover_path: for audio-only items (is_video=False), a still image to
+    loop as the video track — embedded cover art or a downloaded
+    thumbnail (see downloader.py). None falls back to a black frame."""
+    global _ffmpeg_proc, _current_filepath, _current_is_video, _current_cover_path
     global _elapsed_before_current_segment, _segment_started_at
 
     await _stop_ffmpeg_only(suppress_callback=True)  # clean slate, no spurious advance
@@ -221,16 +241,18 @@ async def play(filepath: str, is_video: bool, resume_seconds: float = 0.0):
     server_url, stream_key = await _get_rtmp_credentials(peer)
     rtmp_target = server_url.rstrip("/") + "/" + stream_key
 
-    cmd = _build_ffmpeg_cmd(filepath, is_video, rtmp_target, resume_seconds)
+    cmd = _build_ffmpeg_cmd(filepath, is_video, rtmp_target, resume_seconds, cover_path)
     _ffmpeg_proc = await asyncio.create_subprocess_exec(
         *cmd, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE,
     )
     _current_filepath = filepath
     _current_is_video = is_video
+    _current_cover_path = cover_path
     _elapsed_before_current_segment = resume_seconds
     _segment_started_at = time.monotonic()
 
-    log.info("ffmpeg RTMP push started for %s (pid %s, resume=%.1fs)", filepath, _ffmpeg_proc.pid, resume_seconds)
+    log.info("ffmpeg RTMP push started for %s (pid %s, resume=%.1fs, cover=%s)",
+              filepath, _ffmpeg_proc.pid, resume_seconds, cover_path)
     asyncio.create_task(_watch_ffmpeg(_ffmpeg_proc, filepath))
 
 
@@ -247,7 +269,9 @@ async def resume():
     """Resumes the currently-paused item from where pause() left off."""
     if _current_filepath is None:
         raise RuntimeError("Nothing to resume — no item is loaded.")
-    await play(_current_filepath, _current_is_video, resume_seconds=_elapsed_before_current_segment)
+    await play(_current_filepath, _current_is_video,
+               resume_seconds=_elapsed_before_current_segment,
+               cover_path=_current_cover_path)
 
 
 async def stop_playback():
@@ -255,11 +279,12 @@ async def stop_playback():
     skipping to the next queue item, or as part of end_call()).
     Suppressed so it doesn't ALSO fire on_finished_callback — callers
     that skip already advance the queue themselves."""
-    global _elapsed_before_current_segment, _segment_started_at, _current_filepath
+    global _elapsed_before_current_segment, _segment_started_at, _current_filepath, _current_cover_path
     await _stop_ffmpeg_only(suppress_callback=True)
     _elapsed_before_current_segment = 0.0
     _segment_started_at = None
     _current_filepath = None
+    _current_cover_path = None
 
 
 async def end_call():
