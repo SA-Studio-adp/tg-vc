@@ -402,7 +402,11 @@ def _friendly_blocked_message() -> str:
             "server is actually running and reachable at "
             "POT_PROVIDER_BASE_URL, and that COOKIES_FILE points to fresh, "
             "currently-valid cookies (re-export them; expired cookies fail "
-            "the same way as missing ones). But also know this: bgutil's "
+            "the same way as missing ones). Check the server logs for a "
+            "'YouTube diagnostic trace' entry just above this error — it "
+            "shows exactly which client and step (cookies, PO token "
+            "request, or the bot check itself) actually failed, instead "
+            "of guessing. But also know this: bgutil's "
             "own maintainers now warn that PO tokens frequently don't "
             "clear YouTube's bot check at all on datacenter IPs like "
             "Render's, even when everything is configured correctly — this "
@@ -416,6 +420,76 @@ def _friendly_blocked_message() -> str:
         )
     tips.append("Also keep yt-dlp updated: pip install -U yt-dlp.")
     return " ".join(tips)
+
+
+class _DiagLogger:
+    """Captures yt-dlp's own debug/info/warning/error lines for
+    _diagnose_youtube_failure below. Kept separate from the normal
+    quiet=True path so successful downloads stay quiet — this only
+    runs once, after a sign-in/reloaded failure, specifically to
+    surface which player client and PO-token step actually failed."""
+    def __init__(self):
+        self.lines = []
+
+    def debug(self, msg):
+        self.lines.append(msg)
+
+    def info(self, msg):
+        self.lines.append(msg)
+
+    def warning(self, msg):
+        self.lines.append(msg)
+
+    def error(self, msg):
+        self.lines.append(msg)
+
+
+def _diagnose_youtube_failure(url: str):
+    """Re-runs extract_info (metadata only, no download) with verbose
+    logging on, purely to capture yt-dlp's internal client/PO-token
+    negotiation trace and dump it to Render's (or wherever) logs at
+    ERROR level. The normal quiet=True path never shows this detail,
+    so a bare "Sign in to confirm you're not a bot" gives no way to
+    tell WHICH client failed or whether a PO token was even attempted
+    — this makes that visible without guessing at a fix blind a
+    second time. Best-effort: any failure here is swallowed, since
+    diagnostics must never mask or replace the real error being raised
+    to the caller."""
+    try:
+        diag = _DiagLogger()
+        opts = {
+            **_base_opts(),
+            "quiet": False,
+            "no_warnings": False,
+            "verbose": True,
+            "logger": diag,
+            "skip_download": True,
+        }
+        try:
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                ydl.extract_info(url, download=False)
+        except Exception:
+            pass  # we only care about what got logged along the way
+
+        # Keep only the lines that actually matter for this diagnosis —
+        # which client was tried, whether a PO token was requested and
+        # for what, and any explicit error — not yt-dlp's full verbose
+        # dump (format lists, etc.) which would just bury the signal.
+        relevant = [
+            l for l in diag.lines
+            if any(kw in l for kw in (
+                "player_client", "Requesting", "Downloading", "player API",
+                "PO Token", "pot", "POT", "GetPOT", "ERROR", "Sign in",
+                "sign in", "bgutil", "cookies",
+            ))
+        ]
+        log.error(
+            "YouTube diagnostic trace for %s (which client/step actually "
+            "failed):\n%s",
+            url, "\n".join(relevant[-40:]) or "(no relevant lines captured)",
+        )
+    except Exception:
+        log.exception("Diagnostic capture itself failed (non-fatal, ignoring)")
 
 
 def _run_ytdlp(url: str, audio_only: bool) -> DownloadResult:
@@ -459,6 +533,7 @@ def _run_ytdlp(url: str, audio_only: bool) -> DownloadResult:
     except yt_dlp.utils.DownloadError as e:
         msg = str(e)
         if "reloaded" in msg.lower() or "sign in" in msg.lower():
+            _diagnose_youtube_failure(url)
             raise DownloadError(_friendly_blocked_message())
         raise DownloadError(msg)
 
