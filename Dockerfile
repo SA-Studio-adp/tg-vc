@@ -6,7 +6,7 @@
 FROM python:3.12-slim
 
 # --- system deps ---
-# ffmpeg: required by py-tgcalls to transcode/pipe media into the VC.
+# ffmpeg: required to transcode/pipe media into the RTMP push.
 # nodejs/npm: required to build+run the bgutil PO-token server (it's a
 #   TypeScript/Node HTTP service, not a Python package, despite the pip
 #   plugin sharing its name).

@@ -1,52 +1,62 @@
 """
-Streams into the group's video chat via RTMP push (ffmpeg -> Telegram's
-RTMP ingest), the same mechanism as the "Stream with other apps" dialog
-in the Telegram app (OBS-style). This is a separate path from
-vc_player.py, which joins the call as a WebRTC participant via
-pytgcalls. RTMP push has a real advantage for this bot's use case:
-Telegram treats it as an ordinary incoming broadcast, so there's no
-client-side video/audio track negotiation for pytgcalls to get wrong —
-if pytgcalls' video detection is ever flaky again, this path sidesteps
-the whole class of problem.
+RTMP-push streaming engine for the group's video chat — the ONLY
+streaming engine now (vc_player.py / pytgcalls has been removed
+entirely). Telegram just receives this as an ordinary incoming
+broadcast (same mechanism as the "Stream with other apps" / OBS
+dialog), so there's no client-side WebRTC video-track negotiation for
+a library to get wrong — that negotiation is what was silently
+falling back to audio-only before.
 
-Trade-offs vs vc_player.py's approach, worth knowing before choosing
-between /vplay (pytgcalls) and /rtmpplay (this):
-  - RTMP push has a few seconds of inherent latency (Telegram buffers
-    and re-encodes it) — fine for playing a video, not for anything
-    needing tight sync with the room.
-  - Pause/resume/seek aren't controllable through the RTMP connection
-    itself the way pytgcalls exposes them — this module stops/restarts
-    ffmpeg rather than pausing a live stream, so "pause" here means
-    "the stream drops and viewers see 'stream ended' briefly," not a
-    true pause. queue_manager's existing pause/resume commands are
-    wired to vc_player, not this module, for that reason.
-  - Requires the group call to exist as an RTMP-source call
-    specifically (created with rtmp_stream=True below) — a call
-    already joined via pytgcalls is a normal WebRTC call and can't
-    also accept an RTMP push at the same time.
+=== Audio-only items (/vplaym) ===
+The group call here is created as an RTMP-source *video* chat, and
+Telegram's RTMP ingest expects a video track — there's no "radio mode"
+toggle the way pytgcalls' Flags.IGNORE offered. Audio-only files are
+paired with a synthesized static black frame (ffmpeg `lavfi color`
+source) so /vplaym still works without the person requesting music
+needing to know it's technically a silent black video underneath.
 
-How the credentials in your screenshot map to this code: the "Server
-URL" + "Stream Key" shown in Telegram's UI are exactly what
-phone.GetGroupCallStreamRtmpUrl returns below — this module fetches
-them via the same MTProto call the app itself makes when you open that
-dialog, rather than you copying them out by hand each time.
+=== Soft pause/resume ===
+RTMP push has no native pause. pause() SIGTERMs ffmpeg after recording
+how many seconds had played (via a monotonic clock started when
+playback began); resume() restarts ffmpeg on the same file with
+`-ss <that many seconds>`. There's a re-encode warm-up gap of roughly
+a second on resume — inherent to restarting ffmpeg's own startup, not
+a bug worth chasing.
+
+=== Two bugs fixed here that showed up in production ===
+1. "int too big to convert" from CreateGroupCall: Telegram's random_id
+   is a SIGNED 32-bit int. The original `int.from_bytes(os.urandom(4),
+   "big")` produced an unsigned value up to 2**32-1, which overflows
+   int32 on roughly half of all random draws. Fixed by adding
+   `signed=True`.
+2. "PoTokenProvider BgUtilHTTP already registered" from yt-dlp: this
+   used to be detected in downloader.py by explicitly
+   `importlib.import_module`-ing the plugin. yt-dlp ALSO autodiscovers
+   and imports that same plugin itself on first YoutubeDL()
+   instantiation, via its own plugin loader — which doesn't share
+   Python's normal sys.modules cache the way a plain `import` does. So
+   the plugin's module-level registration code ran twice, and the
+   second run hit an assertion that it was already registered. Fixed
+   in downloader.py by checking the package is *installed* via
+   importlib.metadata instead of importing its module — detection no
+   longer imports anything, so yt-dlp's own loader is the only thing
+   that ever does.
 """
 import asyncio
 import logging
 import os
+import time
 import signal
 
 from pyrogram import Client
 from pyrogram.raw.functions.phone import (
     CreateGroupCall,
     DiscardGroupCall,
-    GetGroupCall,
     GetGroupCallStreamRtmpUrl,
 )
 from pyrogram.raw.types import InputGroupCall
 
 from config import API_ID, API_HASH, SESSION_STRING, CHAT_ID
-from downloader import cleanup_job
 
 log = logging.getLogger("rtmp_streamer")
 
@@ -58,22 +68,31 @@ pyro_client = Client(
     in_memory=True,
 )
 
-# Tracks the currently-active RTMP-source call and ffmpeg push process,
-# so a second /rtmpplay can stop the first cleanly instead of leaving
-# an orphaned call or ffmpeg process behind.
 _active_call: InputGroupCall | None = None
 _ffmpeg_proc: asyncio.subprocess.Process | None = None
-_on_finished_callback = None  # set by bot.py, mirrors vc_player's pattern
+_current_filepath: str | None = None
+_current_is_video: bool = True
+_elapsed_before_current_segment: float = 0.0   # seconds already played, across any prior pause(s)
+_segment_started_at: float | None = None       # time.monotonic() when the currently-running ffmpeg segment began
+_suppress_finish_callback: bool = False
+
+# Set by bot.py. Called ONLY on a natural finish (end of file) or an
+# ffmpeg error — never on pause()/stop()/skip, which the caller already
+# knows about and handles itself. This mirrors the old vc_player's
+# on_stream_end_callback so bot.py's queue-advance logic didn't need to
+# change shape, just which module it calls.
+on_finished_callback = None
 
 
-async def start_bot():
-    """Call once at startup, alongside vc_player.start()."""
+async def start():
     await pyro_client.start()
     log.info("RTMP userbot connected")
 
 
-async def stop_bot():
-    await stop_stream()
+async def stop():
+    """Full shutdown: ends the call and disconnects the userbot. Call
+    once at process shutdown (matches old vc_player.stop())."""
+    await end_call()
     await pyro_client.stop()
 
 
@@ -90,19 +109,17 @@ async def _get_rtmp_credentials(peer, revoke: bool = False):
 
 async def _ensure_rtmp_call() -> InputGroupCall:
     """Returns an InputGroupCall for an RTMP-source video chat in
-    CHAT_ID, creating one if none exists yet. Safe to call repeatedly —
-    reuses `_active_call` if we already created one this run."""
+    CHAT_ID, creating one if none exists yet."""
     global _active_call
     if _active_call is not None:
         return _active_call
 
     peer = await pyro_client.resolve_peer(CHAT_ID)
+    # signed=True: see module docstring, bug #1.
+    random_id = int.from_bytes(os.urandom(4), "big", signed=True)
     updates = await pyro_client.invoke(
-        CreateGroupCall(peer=peer, random_id=int.from_bytes(os.urandom(4), "big"), rtmp_stream=True)
+        CreateGroupCall(peer=peer, random_id=random_id, rtmp_stream=True)
     )
-    # CreateGroupCall's Updates payload carries the new call's
-    # id/access_hash inside an UpdateGroupCall — dig it out rather than
-    # assuming a fixed position, since other update types can be mixed in.
     call = None
     for u in updates.updates:
         if hasattr(u, "call"):
@@ -120,82 +137,47 @@ async def _ensure_rtmp_call() -> InputGroupCall:
     return _active_call
 
 
-async def start_stream(filepath: str, loop: bool = False, delete_when_done: bool = True):
-    """Starts pushing `filepath` into the group's video chat over RTMP.
-    Stops any stream already in progress first. Set loop=True to repeat
-    the file indefinitely (ffmpeg -stream_loop -1) until stop_stream()
-    is called — useful for a single background/holding video.
-
-    delete_when_done=True (the default) removes `filepath`'s job
-    directory once ffmpeg exits, however it exits — finished naturally,
-    errored out, or was stopped via stop_stream()/end_call(). Pass
-    False if you're intentionally reusing the same file across multiple
-    start_stream() calls (e.g. a persistent loop=True holding video)
-    and don't want it deleted out from under a later restart.
-    """
-    await stop_stream()  # clean slate; also frees the previous ffmpeg proc
-
-    peer = await pyro_client.resolve_peer(CHAT_ID)
-    await _ensure_rtmp_call()
-    server_url, stream_key = await _get_rtmp_credentials(peer)
-    rtmp_target = server_url.rstrip("/") + "/" + stream_key
-
-    # -re paces input at its native frame rate — required for RTMP push
-    # (without it ffmpeg dumps the whole file as fast as disk I/O
-    # allows, which Telegram's ingest doesn't buffer for and will
-    # reject/stutter on). Re-encode rather than -c copy: Telegram's
-    # RTMP ingest is picky about GOP/keyframe interval and expects a
-    # steady keyframe roughly every 2s, which most downloaded files
-    # don't already have.
+def _build_ffmpeg_cmd(filepath: str, is_video: bool, rtmp_target: str, resume_seconds: float) -> list:
     cmd = ["ffmpeg", "-hide_banner", "-loglevel", "warning"]
-    if loop:
-        cmd += ["-stream_loop", "-1"]
+    if resume_seconds > 0:
+        # Input-side seek: fast, close enough for this use case (no
+        # need for output-side frame-accurate seeking here).
+        cmd += ["-ss", f"{resume_seconds:.2f}"]
+
+    if is_video:
+        cmd += ["-re", "-i", filepath]
+        video_map, audio_map = ["-map", "0:v:0"], ["-map", "0:a:0?"]
+    else:
+        # Audio-only source: pair with a synthetic black frame — see
+        # module docstring. -shortest trims the (infinite) lavfi video
+        # source down to the audio's actual length.
+        cmd += [
+            "-f", "lavfi", "-i", "color=c=black:s=1280x720:r=25",
+            "-re", "-i", filepath,
+        ]
+        video_map, audio_map = ["-map", "0:v:0"], ["-map", "1:a:0?"]
+        cmd += ["-shortest"]
+
     cmd += [
-        "-re", "-i", filepath,
+        *video_map, *audio_map,
         "-c:v", "libx264", "-preset", "veryfast", "-b:v", "2500k",
-        "-g", "60", "-keyint_min", "60",  # ~2s keyframe interval at 30fps
+        "-g", "60", "-keyint_min", "60",  # ~2s keyframe interval at 30fps — Telegram's RTMP ingest expects steady keyframes
         "-c:a", "aac", "-b:a", "128k", "-ar", "44100",
         "-f", "flv", rtmp_target,
     ]
-
-    global _ffmpeg_proc
-    _ffmpeg_proc = await asyncio.create_subprocess_exec(
-        *cmd,
-        stdout=asyncio.subprocess.DEVNULL,
-        stderr=asyncio.subprocess.PIPE,
-    )
-    log.info("ffmpeg RTMP push started for %s (pid %s)", filepath, _ffmpeg_proc.pid)
-    asyncio.create_task(_watch_ffmpeg(_ffmpeg_proc, filepath, delete_when_done))
+    return cmd
 
 
-async def _watch_ffmpeg(proc: asyncio.subprocess.Process, filepath: str, delete_when_done: bool):
-    """Waits for ffmpeg to exit (end of file, error, or an explicit
-    stop) and logs stderr on non-zero exit so RTMP rejection reasons
-    aren't silently lost. Deletes the source file's job directory
-    afterward when delete_when_done is set, regardless of which of
-    those three ways it exited — matches vc_player/queue_manager's
-    existing "cleanup once a file is done being streamed" behavior."""
-    _, stderr = await proc.communicate()
-    if proc.returncode not in (0, None, -signal.SIGTERM):
-        log.error(
-            "ffmpeg RTMP push for %s exited with code %s:\n%s",
-            filepath, proc.returncode, stderr.decode(errors="replace")[-2000:],
-        )
-    else:
-        log.info("ffmpeg RTMP push for %s finished normally", filepath)
-    if delete_when_done:
-        cleanup_job(filepath)
-        log.info("Deleted %s after RTMP stream ended", filepath)
-    if _on_finished_callback and proc is _ffmpeg_proc:
-        await _on_finished_callback()
-
-
-async def stop_stream():
-    """Stops the current ffmpeg push, if any. Leaves the RTMP call
-    itself intact (reused by the next start_stream) — use end_call()
-    to actually discard the video chat."""
-    global _ffmpeg_proc
+async def _stop_ffmpeg_only(suppress_callback: bool):
+    """Internal: stops the running ffmpeg process without touching the
+    RTMP call itself, optionally suppressing on_finished_callback (used
+    for pause/skip/replace, where the caller already knows and handles
+    it — only a genuinely natural finish or error should auto-advance
+    the queue)."""
+    global _ffmpeg_proc, _suppress_finish_callback
     if _ffmpeg_proc is not None and _ffmpeg_proc.returncode is None:
+        if suppress_callback:
+            _suppress_finish_callback = True
         _ffmpeg_proc.send_signal(signal.SIGTERM)
         try:
             await asyncio.wait_for(_ffmpeg_proc.wait(), timeout=5)
@@ -204,11 +186,87 @@ async def stop_stream():
     _ffmpeg_proc = None
 
 
+async def _watch_ffmpeg(proc: asyncio.subprocess.Process, filepath: str):
+    """Waits for ffmpeg to exit and logs stderr on a non-signal exit so
+    RTMP rejection reasons aren't silently lost. Fires
+    on_finished_callback only when this wasn't a suppressed
+    (pause/skip/replace) stop."""
+    global _suppress_finish_callback
+    _, stderr = await proc.communicate()
+    suppressed = _suppress_finish_callback
+    _suppress_finish_callback = False
+
+    if proc.returncode not in (0, None, -signal.SIGTERM):
+        log.error(
+            "ffmpeg RTMP push for %s exited with code %s:\n%s",
+            filepath, proc.returncode, stderr.decode(errors="replace")[-2000:],
+        )
+    else:
+        log.info("ffmpeg RTMP push for %s ended (suppressed=%s)", filepath, suppressed)
+
+    if not suppressed and proc is _ffmpeg_proc and on_finished_callback:
+        await on_finished_callback()
+
+
+async def play(filepath: str, is_video: bool, resume_seconds: float = 0.0):
+    """Starts (or restarts) the RTMP push for `filepath`. Named `play`
+    to match the old vc_player.play() call shape in bot.py."""
+    global _ffmpeg_proc, _current_filepath, _current_is_video
+    global _elapsed_before_current_segment, _segment_started_at
+
+    await _stop_ffmpeg_only(suppress_callback=True)  # clean slate, no spurious advance
+
+    peer = await pyro_client.resolve_peer(CHAT_ID)
+    await _ensure_rtmp_call()
+    server_url, stream_key = await _get_rtmp_credentials(peer)
+    rtmp_target = server_url.rstrip("/") + "/" + stream_key
+
+    cmd = _build_ffmpeg_cmd(filepath, is_video, rtmp_target, resume_seconds)
+    _ffmpeg_proc = await asyncio.create_subprocess_exec(
+        *cmd, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE,
+    )
+    _current_filepath = filepath
+    _current_is_video = is_video
+    _elapsed_before_current_segment = resume_seconds
+    _segment_started_at = time.monotonic()
+
+    log.info("ffmpeg RTMP push started for %s (pid %s, resume=%.1fs)", filepath, _ffmpeg_proc.pid, resume_seconds)
+    asyncio.create_task(_watch_ffmpeg(_ffmpeg_proc, filepath))
+
+
+async def pause():
+    """Soft-pauses: stops ffmpeg, remembers elapsed playback time so
+    resume() can restart from (approximately) the same spot."""
+    global _elapsed_before_current_segment
+    if _segment_started_at is not None:
+        _elapsed_before_current_segment += time.monotonic() - _segment_started_at
+    await _stop_ffmpeg_only(suppress_callback=True)
+
+
+async def resume():
+    """Resumes the currently-paused item from where pause() left off."""
+    if _current_filepath is None:
+        raise RuntimeError("Nothing to resume — no item is loaded.")
+    await play(_current_filepath, _current_is_video, resume_seconds=_elapsed_before_current_segment)
+
+
+async def stop_playback():
+    """Stops the current item without ending the call (used before
+    skipping to the next queue item, or as part of end_call()).
+    Suppressed so it doesn't ALSO fire on_finished_callback — callers
+    that skip already advance the queue themselves."""
+    global _elapsed_before_current_segment, _segment_started_at, _current_filepath
+    await _stop_ffmpeg_only(suppress_callback=True)
+    _elapsed_before_current_segment = 0.0
+    _segment_started_at = None
+    _current_filepath = None
+
+
 async def end_call():
     """Fully discards the RTMP group call, ending the video chat for
-    everyone — mirrors vc_player.end_call()'s close=True behavior."""
+    everyone."""
     global _active_call
-    await stop_stream()
+    await stop_playback()
     if _active_call is not None:
         try:
             await pyro_client.invoke(DiscardGroupCall(call=_active_call))
@@ -219,10 +277,3 @@ async def end_call():
 
 def is_streaming() -> bool:
     return _ffmpeg_proc is not None and _ffmpeg_proc.returncode is None
-
-
-def set_on_finished_callback(cb):
-    """Mirrors vc_player's on_stream_end_callback pattern so bot.py can
-    trigger 'play next' the same way for both streaming paths."""
-    global _on_finished_callback
-    _on_finished_callback = cb

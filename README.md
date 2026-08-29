@@ -5,11 +5,13 @@ Streams YouTube/audio/direct-link media directly into a Telegram group's
 
 ## Why this needs two Telegram identities
 
-Telegram's Bot API has no way to join or stream into a voice chat — that's
-only possible through the full MTProto client API, which means a real user
-account ("userbot") has to do the actual joining/streaming. Your bot still
-handles all the commands; it just delegates the streaming part to the
-userbot behind the scenes via [py-tgcalls](https://pypi.org/project/py-tgcalls/).
+Telegram's Bot API has no way to join or stream into a voice/video chat —
+that's only possible through the full MTProto client API, which means a
+real user account ("userbot") has to do the actual streaming. Your bot
+still handles all the commands; it just delegates the streaming part to
+the userbot, which pushes media into the group's video chat over **RTMP**
+(the same mechanism as OBS's "Stream with other apps" — ordinary incoming
+broadcast, no client-side call negotiation involved).
 
 So you need:
 1. A **bot** (via @BotFather) — handles `/vplay`, `/vqueue`, etc.
@@ -57,16 +59,18 @@ python bot.py
 - `/vqueue` — show the queue
 - `/vpause` / `/vresume` — real pause/resume in the voice chat
 - `/vskip` — skip to the next item
-- `/vstop` — clear the queue and **end** the voice chat (not just leave it —
-  `close=True` actually discards the call for everyone)
+- `/vstop` — clear the queue and **end** the video chat for everyone
+  (discards the RTMP-source call, not just leaving it)
 
 The bot's `/` command menu in Telegram clients is synced automatically on
 every startup from the list in `bot.py` (`BOT_COMMANDS`) — no need to
 manually edit anything via @BotFather when you add or rename a command.
 
-Unlike the old channel-post version, pause/resume here are **real** —
-py-tgcalls actually pauses the live stream rather than just relabeling a
-sent message.
+Pause/resume here are **soft**: there's no native pause on an RTMP push,
+so `/vpause` stops ffmpeg while remembering elapsed playback time, and
+`/vresume` restarts it with `-ss <elapsed>`. Expect roughly a one-second
+gap on resume while ffmpeg re-establishes the RTMP connection — that's
+inherent to restarting the process, not a bug.
 
 ## Web dashboard
 The bot also runs a small web page (on `$PORT`) showing what's queued and
@@ -198,12 +202,15 @@ startup and uses that copy, so you don't need to do anything extra beyond
 setting `COOKIES_FILE` to the Secret File's mounted path.
 
 ## Notes / limitations
-- Single voice chat at a time (`CHAT_ID` in config) — this isn't a
-  multi-chat/multi-worker setup like the old per-chat queue was.
-- The voice chat must already be active, or the group must allow the
-  userbot to auto-start one (depends on `auto_start` in the call config —
-  currently left at its py-tgcalls default).
-- Hosting: this needs `ffmpeg` on PATH and a host that allows persistent
-  processes with outbound UDP/TCP for the MTProto voice connection. Some
-  free-tier hosts restrict this — a small VPS is the more reliable choice
-  for the userbot side.
+- Single video chat at a time (`CHAT_ID` in config) — this isn't a
+  multi-chat/multi-worker setup.
+- The video chat is created fresh (as an RTMP-source call) on the first
+  `/vplay`-family command if one isn't already running — you don't need
+  to manually start it first.
+- No true pause/resume/seek at the protocol level — see the soft
+  pause/resume note above.
+- Hosting: this needs `ffmpeg` on PATH, Node.js (for the PO-token
+  server — see the Docker section above), and a host that allows
+  persistent processes with outbound TCP for the RTMP push. Some
+  free-tier hosts restrict outbound TCP on non-standard ports — check
+  that before deploying.

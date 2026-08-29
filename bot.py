@@ -11,7 +11,6 @@ from downloader import (
     cleanup_job,
 )
 from queue_manager import queue, QueueItem, MediaType
-import vc_player
 import rtmp_streamer
 import web_dashboard
 
@@ -39,11 +38,18 @@ async def guard(update: Update) -> bool:
 
 
 # ---------- playback control ----------
+# Single engine now: rtmp_streamer (RTMP push into the group's video
+# chat). The earlier pytgcalls-based vc_player.py has been removed —
+# its client-side video-track negotiation was the source of the
+# "audio plays, video doesn't" reports; RTMP push is an ordinary
+# incoming broadcast on Telegram's side, so there's no separate
+# negotiation step to get wrong. queue_manager / the /v* commands
+# below are otherwise unchanged in shape from before.
 
 async def _play_item(item: QueueItem):
-    """Actually starts streaming `item` into the voice chat."""
-    is_video = item.media_type == MediaType.VIDEO
-    await vc_player.play(item.filepath, is_video=is_video)
+    """Actually starts streaming `item` into the video chat."""
+    is_video = item.media_type != MediaType.AUDIO
+    await rtmp_streamer.play(item.filepath, is_video=is_video)
     queue.is_playing = True
 
 
@@ -64,9 +70,9 @@ async def _advance_and_play(bot):
         except Exception:
             pass
     else:
-        await vc_player.end_call()
+        await rtmp_streamer.end_call()
         try:
-            await bot.send_message(chat_id=CHAT_ID, text="⏹ Queue finished — voice chat ended.")
+            await bot.send_message(chat_id=CHAT_ID, text="⏹ Queue finished — video chat ended.")
         except Exception:
             pass
     return nxt
@@ -81,14 +87,11 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "<b>/vplaym &lt;url&gt;</b> — queue + stream YouTube Music / audio\n"
         "<b>/vfile &lt;url&gt;</b> — queue + stream a direct file link\n"
         "<b>/vqueue</b> — show the current queue\n"
-        "<b>/vpause</b> / <b>/vresume</b> — real pause/resume in the VC\n"
+        "<b>/vpause</b> / <b>/vresume</b> — pause/resume the stream\n"
         "<b>/vskip</b> — skip to the next item\n"
-        "<b>/vstop</b> — clear queue and end the VC\n\n"
-        "<b>/rtplay &lt;url&gt;</b> — stream a YouTube video via RTMP push "
-        "instead (alternative engine — try if /vplay's video won't show; "
-        "no pause/resume/seek on this path, just play/stop)\n"
-        "<b>/rtfile &lt;url&gt;</b> — stream a direct file link via RTMP push\n"
-        "<b>/rtstop</b> — stop the RTMP stream\n\n"
+        "<b>/vstop</b> — clear queue and end the video chat\n\n"
+        "Streaming is via RTMP push into the group's video chat — the "
+        "same mechanism as OBS's \"Stream with other apps\".\n\n"
         "There's also a web dashboard for controlling playback from a browser — "
         "ask whoever deployed the bot for the link.",
         parse_mode="HTML",
@@ -168,14 +171,13 @@ async def _enqueue(update, context, url, media_type, downloader_fn):
         queue.current_index = 0
 
     if was_empty:
-        await status_msg.edit_text("🔊 Joining voice chat & starting stream…")
+        await status_msg.edit_text("📡 Starting RTMP stream to the video chat…")
         try:
             await _play_item(item)
         except Exception as e:
             await status_msg.edit_text(
                 f"❌ Couldn't start the stream: {e}\n\n"
-                f"Make sure the userbot account is a member of the group and "
-                f"a voice chat is active (or can be auto-started)."
+                f"Make sure the userbot account is a member of the group."
             )
             queue.clear()
             cleanup_job(item.filepath)
@@ -219,7 +221,7 @@ async def cmd_vpause(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not queue.current:
         await update.message.reply_text("Nothing is playing.")
         return
-    await vc_player.pause()
+    await rtmp_streamer.pause()
     queue.is_playing = False
     await update.message.reply_text("⏸ Paused.")
 
@@ -230,7 +232,7 @@ async def cmd_vresume(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not queue.current:
         await update.message.reply_text("Nothing is playing.")
         return
-    await vc_player.resume()
+    await rtmp_streamer.resume()
     queue.is_playing = True
     await update.message.reply_text("▶️ Resumed.")
 
@@ -251,72 +253,17 @@ async def cmd_vstop(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for it in queue.items:
         cleanup_job(it.filepath)
     queue.clear()
-    await vc_player.end_call()
-    await update.message.reply_text("🛑 Stopped and ended the voice chat.")
-
-
-# ---------- RTMP streaming (alternative to /vplay) ----------
-#
-# Separate command family, not merged into the /vplay queue: RTMP push
-# doesn't support real pause/resume/seek the way the pytgcalls path
-# does (see rtmp_streamer.py's module docstring), so mixing the two
-# queue models would be misleading. One RTMP item plays at a time;
-# use /rtplay again to switch to a different video.
-
-async def _rtmp_enqueue(update: Update, context: ContextTypes.DEFAULT_TYPE, downloader_fn, usage: str):
-    """Shared by /rtplay and /rtfile: download via `downloader_fn`, then
-    start the RTMP push. Kept as one helper so both commands' error
-    handling/messaging stay identical."""
-    if not await guard(update):
-        return
-    url = " ".join(context.args) if context.args else None
-    if not url:
-        await update.message.reply_text(f"Usage: {usage}")
-        return
-
-    status_msg = await update.message.reply_text("⏳ Downloading…")
-    try:
-        result = await downloader_fn(url)
-    except Exception as e:
-        await status_msg.edit_text(f"❌ Download failed: {e}")
-        return
-
-    await status_msg.edit_text("📡 Starting RTMP stream to the video chat…")
-    try:
-        # delete_when_done=True (the default) removes the downloaded
-        # file automatically once ffmpeg finishes pushing it — no
-        # separate cleanup step needed here.
-        await rtmp_streamer.start_stream(result.filepath)
-    except Exception as e:
-        await status_msg.edit_text(f"❌ Couldn't start the RTMP stream: {e}")
-        cleanup_job(result.filepath)
-        return
-    await status_msg.edit_text(f"▶️ Streaming via RTMP: {result.title} [{fmt_duration(result.duration)}]\n(file will be auto-deleted once the stream ends)")
-
-
-async def cmd_rtplay(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await _rtmp_enqueue(update, context, download_youtube_video, "/rtplay <youtube url>")
-
-
-async def cmd_rtfile(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await _rtmp_enqueue(update, context, download_direct_file, "/rtfile <direct file url>")
-
-
-async def cmd_rtstop(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await guard(update):
-        return
-    if not rtmp_streamer.is_streaming():
-        await update.message.reply_text("Nothing is RTMP-streaming right now.")
-        return
     await rtmp_streamer.end_call()
-    await update.message.reply_text("🛑 Stopped the RTMP stream and ended the video chat.")
+    await update.message.reply_text("🛑 Stopped and ended the video chat.")
 
 
 # ---------- stream-end wiring ----------
 
 async def _on_stream_end():
-    """Called by vc_player when ffmpeg/py-tgcalls reports the current
-    stream finished — auto-advances the queue."""
+    """Called by rtmp_streamer when ffmpeg reports the current item
+    finished naturally (or errored) — auto-advances the queue. Never
+    fired for pause/skip/stop, which already handle their own
+    transitions (see rtmp_streamer's on_finished_callback docstring)."""
     app = _app_ref["app"]
     if app is None:
         return
@@ -334,21 +281,15 @@ BOT_COMMANDS = [
     BotCommand("vpause", "Pause the stream"),
     BotCommand("vresume", "Resume the stream"),
     BotCommand("vskip", "Skip to the next item"),
-    BotCommand("vstop", "Clear queue and end the voice chat"),
-    BotCommand("rtplay", "Stream a YouTube video via RTMP push"),
-    BotCommand("rtfile", "Stream a direct file link via RTMP push"),
-    BotCommand("rtstop", "Stop the RTMP stream"),
+    BotCommand("vstop", "Clear queue and end the video chat"),
     BotCommand("help", "Show this bot's commands"),
 ]
 
 
 async def _post_init(app: Application):
     _app_ref["app"] = app
-    vc_player.on_stream_end_callback = _on_stream_end
-    await vc_player.start()
-    log.info("VC player started, userbot connected")
-
-    await rtmp_streamer.start_bot()
+    rtmp_streamer.on_finished_callback = _on_stream_end
+    await rtmp_streamer.start()
     log.info("RTMP streamer started, userbot connected")
 
     # "Auto command updation": pushes the command list to Telegram every
@@ -373,8 +314,7 @@ async def _post_init(app: Application):
 
 
 async def _post_shutdown(app: Application):
-    await vc_player.stop()
-    await rtmp_streamer.stop_bot()
+    await rtmp_streamer.stop()
 
 
 def main():
@@ -395,9 +335,6 @@ def main():
     app.add_handler(CommandHandler("vresume", cmd_vresume))
     app.add_handler(CommandHandler("vskip", cmd_vskip))
     app.add_handler(CommandHandler("vstop", cmd_vstop))
-    app.add_handler(CommandHandler("rtplay", cmd_rtplay))
-    app.add_handler(CommandHandler("rtfile", cmd_rtfile))
-    app.add_handler(CommandHandler("rtstop", cmd_rtstop))
     log.info("Bot starting…")
     app.run_polling()
 

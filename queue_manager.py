@@ -31,7 +31,7 @@ class StreamQueue:
     def __init__(self):
         self.items: list[QueueItem] = []
         self.current_index: int = -1
-        self.is_playing: bool = True  # reflects real pytgcalls pause state now
+        self.is_playing: bool = True  # reflects real rtmp_streamer pause state
 
     @property
     def current(self) -> Optional[QueueItem]:

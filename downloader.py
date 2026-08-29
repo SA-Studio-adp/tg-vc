@@ -1,6 +1,6 @@
 """
 Downloads YouTube video / audio (and generic direct links) via yt-dlp,
-producing a local file that pytgcalls' ffmpeg pipeline can stream from.
+producing a local file that ffmpeg pipes into Telegram over RTMP.
 
 === 2026 UPDATE: PO Token requirement ===
 Through 2026, YouTube expanded its bot-detection so that most player
@@ -49,17 +49,25 @@ from config import DOWNLOAD_DIR, COOKIES_FILE
 
 log = logging.getLogger(__name__)
 
-# Try to detect the PO token plugin. It does NOT install a top-level
-# `bgutil_ytdlp_pot_provider` module — it installs into yt-dlp's own
-# plugin-discovery namespace at `yt_dlp_plugins/extractor/`, which
-# yt-dlp scans automatically. We just check that namespace is present
-# and importable; we never call it directly (yt-dlp does that itself
-# once the extractor_args below point it at the token server).
+# Detect the PO token plugin WITHOUT importing it. It installs into
+# yt-dlp's own plugin-discovery namespace at `yt_dlp_plugins/extractor/`,
+# which yt-dlp scans and imports automatically on the first
+# YoutubeDL() instantiation, using its own plugin loader — a mechanism
+# that does NOT share Python's normal sys.modules cache the way a
+# plain `import` does. An earlier version of this check called
+# `importlib.import_module(...)` on the plugin module directly, which
+# ran the plugin's module-level provider-registration code once via
+# the normal import; yt-dlp's own loader then ran that same
+# registration code AGAIN on the first download, and its registry
+# rejects a second registration of the same provider key — producing
+# "AssertionError: PoTokenProvider BgUtilHTTP already registered" on
+# every single download. Fixed by checking installed *package*
+# metadata instead, which touches no code at all — yt-dlp's own loader
+# remains the only thing that ever imports the plugin module.
 try:
-    import importlib
-    importlib.import_module("yt_dlp_plugins.extractor.getpot_bgutil_http")
+    _pkg_version("bgutil-ytdlp-pot-provider")
     _POT_PROVIDER_AVAILABLE = True
-except ImportError:
+except PackageNotFoundError:
     _POT_PROVIDER_AVAILABLE = False
 
 POT_PROVIDER_BASE_URL = os.environ.get("POT_PROVIDER_BASE_URL", "").strip()
@@ -199,7 +207,7 @@ def _ffprobe_codecs(filepath: str) -> list:
     """Returns [(codec_type, codec_name), ...] for every stream in the
     file — used to tell a real video stream apart from a static image
     (jpg/png/mjpeg), which ffprobe also reports as codec_type=video but
-    which py-tgcalls will otherwise happily stream as a looping 1-frame
+    which the RTMP push would otherwise happily stream as a looping
     'video' rather than rejecting it. That's the mechanism behind
     generic CDN links occasionally streaming a square thumbnail on loop
     instead of the actual video — this catches that case."""
@@ -312,7 +320,7 @@ def _run_ytdlp(url: str, audio_only: bool) -> DownloadResult:
             "outtmpl": out_tmpl,
             "postprocessors": [{
                 "key": "FFmpegExtractAudio",
-                "preferredcodec": "opus",   # cheap for pytgcalls to pipe as VC audio
+                "preferredcodec": "opus",   # cheap for the RTMP push to pipe as VC audio
                 "preferredquality": "192",
             }],
         }

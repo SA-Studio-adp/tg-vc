@@ -181,8 +181,8 @@ def control_remove(item_id):
 @app.route("/control/pause")
 def control_pause():
     _check_token()
-    import vc_player
-    _run_coro(vc_player.pause())
+    import rtmp_streamer
+    _run_coro(rtmp_streamer.pause())
     queue.is_playing = False
     return redirect(url_for("dashboard", token=request.args.get("token")))
 
@@ -190,8 +190,8 @@ def control_pause():
 @app.route("/control/resume")
 def control_resume():
     _check_token()
-    import vc_player
-    _run_coro(vc_player.resume())
+    import rtmp_streamer
+    _run_coro(rtmp_streamer.resume())
     queue.is_playing = True
     return redirect(url_for("dashboard", token=request.args.get("token")))
 
@@ -209,12 +209,12 @@ def control_skip():
 @app.route("/control/stop")
 def control_stop():
     _check_token()
-    import vc_player
+    import rtmp_streamer
     from downloader import cleanup_job
     for it in queue.items:
         cleanup_job(it.filepath)
     queue.clear()
-    _run_coro(vc_player.end_call())
+    _run_coro(rtmp_streamer.end_call())
     return redirect(url_for("dashboard", token=request.args.get("token")))
 
 
