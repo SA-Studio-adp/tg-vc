@@ -128,44 +128,62 @@ and bump `ARG BGUTIL_VERSION` in the `Dockerfile` to match the current
 
 ## Fixing YouTube's "Sign in to confirm you're not a bot" / "The page needs to be reloaded" errors
 Both of these come from the same underlying situation: YouTube periodically
-changes its player JavaScript, and yt-dlp has to keep up. When yt-dlp falls
-behind (or your requests come from a datacenter IP, like Render's), you'll
-see one of:
+changes its player JavaScript and bot-detection, and yt-dlp has to keep up.
+When yt-dlp falls behind (or your requests come from a datacenter IP, like
+Render's), you'll see one of:
 - `Sign in to confirm you're not a bot`
 - `The page needs to be reloaded.`
 - Or, most deceptively: **the download "succeeds" but only audio comes
-  through**, because video formats need the signature decryption that's
+  through**, because video formats need signature/token decryption that's
   breaking, while audio formats don't — so a loose format selector can
   silently fall back to audio-only instead of failing.
 
-This bot now defends against all three:
+This bot defends against all three:
 
-1. **Player client fallback.** yt-dlp is told to try the `android` and `tv`
-   player clients before `web` — these generally skip the JS signature
-   solving that breaks most often. This alone fixes most "page needs to be
-   reloaded" errors.
-2. **Strict format selection.** The video format selector no longer has a
-   silent "just give me anything" fallback. If a real video+audio
-   combination can't be resolved, it fails with a clear error instead of
-   quietly shipping an audio-only file.
+1. **Player client fallback, corrected mid-2026.** yt-dlp tries `mweb`,
+   `web_safari`, `web`, then `android`, in that order. This isn't arbitrary:
+   PO tokens are platform-specific (a Web token can't be used on
+   Android/iOS), and this bot's PO-token plugin only generates the
+   web-family token — so the list is ordered to spend its attempts on
+   clients that token actually helps, per
+   [yt-dlp's own current PO Token Guide](https://github.com/yt-dlp/yt-dlp/wiki/PO-Token-Guide),
+   which specifically recommends `mweb` for this plugin. `android` is
+   included last as a token-free long-shot, not a first choice.
+2. **Strict format selection.** The video format selector has no silent
+   "just give me anything" fallback. If a real video+audio combination
+   can't be resolved, it fails with a clear error instead of quietly
+   shipping an audio-only file.
 3. **Post-download validation.** After downloading, `ffprobe` checks the
    actual file for a video stream. If a "video" request somehow still came
    back audio-only, it's rejected with a clear message rather than queued.
 4. **ffprobe duration fallback.** If yt-dlp's own metadata is missing a
    duration (common during these same failures), the bot reads it straight
    from the downloaded file instead of showing 00:00.
-5. **Cookies (see below).** Still recommended — most effective against the
-   "sign in to confirm" bot-check specifically.
+5. **PO tokens (see Docker section above) and cookies (see below).** Both
+   recommended, but read the honest caveat below before assuming a stuck
+   error is a setup mistake.
+
+**The honest limit, as of mid-2026:** even fully correct cookies + PO
+tokens frequently do **not** clear YouTube's bot check on datacenter IP
+ranges (Render's included) — this is acknowledged by
+[bgutil-ytdlp-pot-provider's own maintainers](https://github.com/Brainicism/bgutil-ytdlp-pot-provider/issues/37),
+not a sign your setup is wrong. If everything above checks out and it's
+still failing, the remaining reliable fix is routing YouTube requests
+through a residential/non-datacenter proxy: set `YT_PROXY` to a proxy URL
+(e.g. `http://user:pass@host:port`) — used for YouTube requests only, not
+Telegram or the RTMP push.
 
 **This is an ongoing cat-and-mouse situation, not a one-time fix** — if
 these errors come back later, it usually means YouTube shipped another
 player change yt-dlp hasn't caught up with yet. The fix each time is:
 ```
-pip install -U yt-dlp
+pip install -U yt-dlp bgutil-ytdlp-pot-provider
 ```
 then redeploy. Checking `requirements.txt`'s yt-dlp version against the
 [latest release](https://github.com/yt-dlp/yt-dlp/releases) periodically
-is worth doing if downloads start failing again.
+is worth doing if downloads start failing again — and it's worth
+occasionally re-reading yt-dlp's PO Token Guide linked above, since the
+recommended client for this plugin has changed before and may again.
 
 ## Fixing "Sign in to confirm you're not a bot" specifically (cookies)
 YouTube increasingly blocks download requests coming from datacenter IPs

@@ -31,8 +31,28 @@ Fix strategy here:
   # (see config.py). If unset, yt-dlp just runs without PO tokens,
   # same as before — this is additive, not required to boot.
 
+=== Client selection (corrected mid-2026) ===
+PO tokens are platform-specific and NOT interchangeable (a Web token
+can't be used on Android/iOS), and bgutil-ytdlp-pot-provider only
+generates the web-family token. So YT_PLAYER_CLIENTS below is ordered
+to spend its attempts on clients that token actually helps
+(mweb, web_safari, web — yt-dlp's own PO Token Guide specifically
+recommends mweb for this plugin) before falling back to android, which
+our plugin can't help at all but which occasionally still works
+token-free depending on the video.
+
+=== Datacenter IPs (Render, most cloud hosts): the honest limit ===
+Even a fully correct PO token setup frequently does NOT clear
+YouTube's bot check on datacenter IP ranges — this is acknowledged by
+bgutil-ytdlp-pot-provider's own maintainers (see their GitHub issue
+#37), not a misconfiguration on this bot's end. If downloads still
+fail with everything above set up correctly, set YT_PROXY to a
+residential/non-datacenter proxy URL — that's the remaining reliable
+fix as of mid-2026.
+
 See also: https://github.com/yt-dlp/yt-dlp/issues/17405 (ongoing arms
-race tracking issue) and https://github.com/Brainicism/bgutil-ytdlp-pot-provider
+race tracking issue), https://github.com/yt-dlp/yt-dlp/wiki/PO-Token-Guide,
+and https://github.com/Brainicism/bgutil-ytdlp-pot-provider
 """
 import os
 import re
@@ -73,22 +93,37 @@ except PackageNotFoundError:
 
 POT_PROVIDER_BASE_URL = os.environ.get("POT_PROVIDER_BASE_URL", "").strip()
 
-# Player clients to try, in order. Widened from the original android/web
-# pair because different clients hit different PO token requirements —
-# if one client's token requirement isn't satisfiable in your setup, the
-# next one in line may not need a token at all, or needs a different kind.
-#   - android: usually fine without a token for a while, but has been
-#     increasingly gated through 2026; kept first since it's cheapest
-#     when it works.
-#   - ios: historically slow to get token-gated, good fallback.
-#   - web_safari: separate token pool from plain 'web', sometimes works
-#     when 'web' is rate-limited or blocked.
-#   - web: kept last — most reliable WITH cookies + PO token, but the
-#     most bot-detection-scrutinized client when those aren't present.
-# 'tv' remains excluded: pairing it with cookies can invalidate the
-# cookie session entirely rather than helping (known yt-dlp/YouTube
-# interaction).
-YT_PLAYER_CLIENTS = "android,ios,web_safari,web"
+# Optional residential/SOCKS5 proxy for YouTube requests specifically.
+# See the big caveat below: PO tokens alone increasingly don't clear
+# YouTube's bot check on datacenter IPs (Render's included) — a proxy
+# through a non-datacenter exit is often the only thing that still
+# reliably works as of mid-2026. Purely additive: unset means no proxy,
+# exactly like before.
+YT_PROXY = os.environ.get("YT_PROXY", "").strip()
+
+# Player clients to try, in order. Corrected mid-2026 after checking
+# yt-dlp's current PO Token Guide and bgutil-ytdlp-pot-provider's own
+# docs — the previous list (android,ios,web_safari,web) was subtly
+# wrong:
+#   - PO tokens are platform-specific and NOT interchangeable — a Web
+#     token cannot be used on Android or iOS at all (yt-dlp's PO Token
+#     Guide is explicit about this). Android/iOS need their own
+#     DroidGuard/iOSGuard-generated tokens, which bgutil-ytdlp-pot-
+#     provider does NOT generate (it only does the web-family
+#     BotGuard token). So the old list spent its first two attempts on
+#     clients our installed plugin literally cannot help, before ever
+#     reaching one it can.
+#   - yt-dlp's own PO Token Guide TL;DR, current as of this fix:
+#     "Use a PO Token Provider plugin to provide the mweb client with
+#     a PO Token for GVS requests" — mweb (mobile web), not web, is
+#     the officially recommended pairing with this plugin.
+# New order: mweb and web_safari first (both confirmed working with
+# bgutil in yt-dlp's own recent issue tracker — #15789, #15571), web
+# next (also works, just the most bot-detection-scrutinized), android
+# as a last-ditch attempt in case a specific video happens to still be
+# ungated on it. 'tv' remains excluded: pairing it with cookies can
+# invalidate the cookie session entirely rather than helping.
+YT_PLAYER_CLIENTS = "mweb,web_safari,web,android"
 
 _URL_RE = re.compile(r"^https?://", re.IGNORECASE)
 
@@ -199,6 +234,11 @@ def _base_opts() -> dict:
     cookies_path = _get_writable_cookies_file()
     if cookies_path:
         opts["cookiefile"] = cookies_path
+    if YT_PROXY:
+        # See YT_PROXY's definition above: on datacenter hosts, this is
+        # often the only thing that actually clears YouTube's bot check,
+        # even with PO tokens and cookies both correctly configured.
+        opts["proxy"] = YT_PROXY
     return opts
 
 
@@ -350,12 +390,29 @@ def _friendly_blocked_message() -> str:
             "running companion server's URL (e.g. http://127.0.0.1:4416)."
         )
     else:
+        # Being straight about this rather than implying "configured
+        # correctly" always fixes it: bgutil's own maintainers now warn
+        # that PO tokens frequently don't clear the bot check at all on
+        # datacenter IPs (Render included) — see
+        # github.com/Brainicism/bgutil-ytdlp-pot-provider/issues/37.
+        # Confirm the setup is actually right, but if it is, the real
+        # fix left is routing through a non-datacenter IP.
         tips.append(
-            "PO token support is configured — if it's still failing, "
-            "confirm the companion token server is actually running and "
-            "reachable at POT_PROVIDER_BASE_URL, and that COOKIES_FILE "
-            "points to fresh, currently-valid cookies (re-export them; "
-            "expired cookies fail the same way as missing ones)."
+            "PO token support is configured — confirm the companion token "
+            "server is actually running and reachable at "
+            "POT_PROVIDER_BASE_URL, and that COOKIES_FILE points to fresh, "
+            "currently-valid cookies (re-export them; expired cookies fail "
+            "the same way as missing ones). But also know this: bgutil's "
+            "own maintainers now warn that PO tokens frequently don't "
+            "clear YouTube's bot check at all on datacenter IPs like "
+            "Render's, even when everything is configured correctly — this "
+            "isn't a config bug on your end, YouTube specifically targets "
+            "hosting-provider IP ranges harder than PO tokens can offset. "
+            "If setup checks out and it's still failing, the remaining "
+            "reliable fix is routing YouTube requests through a "
+            "residential/non-datacenter proxy: set the YT_PROXY env var "
+            "to a proxy URL (e.g. http://user:pass@host:port) and this "
+            "bot will use it automatically for YouTube only."
         )
     tips.append("Also keep yt-dlp updated: pip install -U yt-dlp.")
     return " ".join(tips)
