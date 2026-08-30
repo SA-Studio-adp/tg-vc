@@ -489,14 +489,27 @@ class _DiagLogger:
 
 
 def _diagnose_youtube_failure(url: str):
-    """Re-runs extract_info (metadata only, no download) with verbose
-    logging on, purely to capture yt-dlp's internal client/PO-token
-    negotiation trace and dump it to Render's (or wherever) logs at
-    ERROR level. The normal quiet=True path never shows this detail,
-    so a bare "Sign in to confirm you're not a bot" gives no way to
-    tell WHICH client failed or whether a PO token was even attempted
-    — this makes that visible without guessing at a fix blind a
-    second time. Best-effort: any failure here is swallowed, since
+    """Re-runs extract_info (metadata only, no download, no format
+    constraint) purely to capture two things: (1) yt-dlp's internal
+    client/PO-token negotiation trace, same as before, and (2) a direct
+    inspection of the returned format list itself — specifically
+    whether each format actually has a download URL.
+
+    (2) was added after the first version of this function nearly
+    missed a real SABR-gating case: YouTube can return formats that
+    LOOK complete (right height/codec/id) but have no usable URL at
+    all, because the client is being forced onto SABR-only streaming.
+    That shows up in yt-dlp's verbose log under a few different
+    phrasings across versions ("Only images are available for
+    download", "have been skipped as they are missing a URL", "nsig
+    extraction failed") — a keyword filter chasing those exact phrases
+    is fragile and can go stale exactly when a version bump changes
+    the wording. Checking each format dict for a real 'url' field
+    directly is version-independent and answers the actual question:
+    did YouTube give us anything playable at all, regardless of what
+    the log text says about why.
+
+    Best-effort throughout: any failure here is swallowed, since
     diagnostics must never mask or replace the real error being raised
     to the caller."""
     try:
@@ -509,28 +522,67 @@ def _diagnose_youtube_failure(url: str):
             "logger": diag,
             "skip_download": True,
         }
+        result = None
         try:
             with yt_dlp.YoutubeDL(opts) as ydl:
-                ydl.extract_info(url, download=False)
+                # No 'format' override here — yt-dlp's lenient default
+                # selector is far less likely to itself raise before we
+                # get a chance to inspect the raw format list.
+                result = ydl.extract_info(url, download=False)
         except Exception:
-            pass  # we only care about what got logged along the way
+            pass  # we only care about what got logged/returned along the way
 
-        # Keep only the lines that actually matter for this diagnosis —
-        # which client was tried, whether a PO token was requested and
-        # for what, and any explicit error — not yt-dlp's full verbose
-        # dump (format lists, etc.) which would just bury the signal.
+        # Direct format-list inspection — the version-independent check.
+        format_summary_lines = []
+        if result and result.get("formats"):
+            formats = result["formats"]
+            with_url = [f for f in formats if f.get("url")]
+            without_url = [f for f in formats if not f.get("url")]
+            format_summary_lines.append(
+                f"Formats returned: {len(formats)} total, "
+                f"{len(with_url)} with a real download URL, "
+                f"{len(without_url)} WITHOUT one (these are unusable "
+                f"regardless of format-selector syntax — SABR-gated or "
+                f"similar, not a selector problem)."
+            )
+            for f in formats[:25]:
+                format_summary_lines.append(
+                    f"  id={f.get('format_id')!s:>6} proto={f.get('protocol')!s:<12} "
+                    f"vcodec={f.get('vcodec')!s:<12} acodec={f.get('acodec')!s:<10} "
+                    f"height={f.get('height')!s:<5} has_url={bool(f.get('url'))}"
+                )
+        elif result is not None:
+            format_summary_lines.append(
+                "extract_info succeeded but returned NO formats at all — "
+                "not even a format-selector issue, YouTube gave back "
+                "nothing playable for this client/video combination."
+            )
+        else:
+            format_summary_lines.append(
+                "extract_info raised before returning any result — see "
+                "the log trace below for where it failed."
+            )
+
+        # Broadened keyword list — added the SABR/nsig/skip-related terms
+        # that the original narrower list would have silently dropped.
         relevant = [
             l for l in diag.lines
             if any(kw in l for kw in (
                 "player_client", "Requesting", "Downloading", "player API",
                 "PO Token", "pot", "POT", "GetPOT", "ERROR", "Sign in",
-                "sign in", "bgutil", "cookies",
+                "sign in", "bgutil", "cookies", "SABR", "sabr", "skip",
+                "Skip", "nsig", "n function", "missing a URL",
+                "Only images", "js_runtime", "deno", "unavailable",
+                "Unable to extract",
             ))
         ]
+
         log.error(
             "YouTube diagnostic trace for %s (which client/step actually "
-            "failed):\n%s",
-            url, "\n".join(relevant[-40:]) or "(no relevant lines captured)",
+            "failed):\n%s\n\n--- format list inspection ---\n%s",
+            url,
+            "\n".join(relevant[-50:]) or "(no relevant log lines captured)",
+            "\n".join(format_summary_lines),
         )
     except Exception:
         log.exception("Diagnostic capture itself failed (non-fatal, ignoring)")
