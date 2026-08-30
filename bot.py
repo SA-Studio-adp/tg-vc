@@ -8,7 +8,7 @@ from telegram.ext import Application, CommandHandler, ContextTypes
 from config import BOT_TOKEN, ADMIN_IDS, CHAT_ID
 from downloader import (
     download_youtube_video, download_youtube_music, download_direct_file,
-    cleanup_job,
+    cleanup_job, check_proxy_ip,
 )
 from queue_manager import queue, QueueItem, MediaType
 import rtmp_streamer
@@ -295,6 +295,11 @@ async def _post_init(app: Application):
     rtmp_streamer.on_finished_callback = _on_stream_end
     await rtmp_streamer.start()
     log.info("RTMP streamer started, userbot connected")
+
+    # Runs a synchronous request, so hand it to a thread rather than
+    # blocking the event loop during startup — check_proxy_ip() itself
+    # is a no-op (returns immediately) when YT_PROXY isn't set.
+    await asyncio.to_thread(check_proxy_ip)
 
     # "Auto command updation": pushes the command list to Telegram every
     # startup, so the / menu in clients always matches what's in this

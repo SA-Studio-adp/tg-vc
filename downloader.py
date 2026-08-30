@@ -101,6 +101,48 @@ POT_PROVIDER_BASE_URL = os.environ.get("POT_PROVIDER_BASE_URL", "").strip()
 # exactly like before.
 YT_PROXY = os.environ.get("YT_PROXY", "").strip()
 
+
+def check_proxy_ip():
+    """Verifies YT_PROXY is actually reachable and reports the exit IP
+    it presents to the outside world — call this once at bot startup
+    (see bot.py) so a broken/typo'd proxy URL, or a datacenter proxy
+    mistakenly used instead of residential, shows up immediately in the
+    logs rather than being discovered only after a confusing yt-dlp
+    failure. Does nothing (silently) if YT_PROXY isn't set — this is
+    purely a startup diagnostic, never required for the bot to run.
+    Best-effort: any failure here is logged, never raised, since a
+    broken proxy check must never prevent the bot from starting."""
+    if not YT_PROXY:
+        return
+    try:
+        resp = requests.get(
+            "https://api.ipify.org?format=json",
+            proxies={"http": YT_PROXY, "https": YT_PROXY},
+            timeout=10,
+        )
+        resp.raise_for_status()
+        exit_ip = resp.json().get("ip", "?")
+        log.info(
+            "YT_PROXY is configured and reachable — exit IP: %s. "
+            "If this looks like a known datacenter range rather than a "
+            "residential ISP address, double check you signed up for a "
+            "residential (not datacenter) proxy product — a datacenter "
+            "proxy here doesn't help with YouTube's blocking any more "
+            "than Render's own IP does.",
+            exit_ip,
+        )
+    except Exception as e:
+        log.error(
+            "YT_PROXY is set but could not be reached (%s). Double check "
+            "the URL is exactly http://user:pass@host:port with no typos, "
+            "and that the proxy credentials/plan are active. yt-dlp will "
+            "still try to use it as configured — a broken proxy here "
+            "means downloads will fail via the proxy rather than silently "
+            "skipping it, so fix this before assuming YT_PROXY itself "
+            "didn't help.",
+            e,
+        )
+
 # Player clients to try, in order, WITH cookies. All three confirmed
 # (via a real diagnostic trace) to successfully retrieve a PO token —
 # authentication is not the problem for these. The problem, confirmed
