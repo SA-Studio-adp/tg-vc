@@ -62,6 +62,29 @@ from config import API_ID, API_HASH, SESSION_STRING, CHAT_ID
 
 log = logging.getLogger("rtmp_streamer")
 
+# Real-time x264 encoding is CPU-bound, and RTMP push has to keep up
+# with playback speed (-re) or it falls behind and viewers see lag/
+# stutter. On constrained hosting (shared vCPU, e.g. Render's smaller
+# tiers) "veryfast" was still too CPU-heavy to sustain in real time.
+# "ultrafast" is x264's lightest preset by a well-documented margin
+# (roughly 2-3x less CPU than "veryfast", at the cost of a somewhat
+# larger file for the same quality — a fine trade for a live push
+# where nothing is stored afterward anyway). RTMP_ENCODE_PRESET lets
+# this be tuned without a code change if a stronger/weaker host is
+# used later. Valid x264 presets, slowest/best-compression to fastest/
+# lightest: veryslow, slower, slow, medium, fast, faster, veryfast,
+# superfast, ultrafast.
+RTMP_ENCODE_PRESET = os.environ.get("RTMP_ENCODE_PRESET", "ultrafast").strip()
+RTMP_VIDEO_BITRATE = os.environ.get("RTMP_VIDEO_BITRATE", "1800k").strip()
+# Caps real video downloads at 720p regardless of the source
+# resolution — /vplay's format selector allows up to 1080p, but
+# encoding 1080p in real time is meaningfully more CPU-expensive than
+# 720p (roughly 2.25x the pixels) for a difference most viewers won't
+# notice in a Telegram voice-chat video window. Cover-art/black-frame
+# audio-only items are already generated at 1280x720 directly, so this
+# only affects the is_video=True branch.
+RTMP_MAX_HEIGHT = os.environ.get("RTMP_MAX_HEIGHT", "720").strip()
+
 pyro_client = Client(
     "userbot_rtmp",
     api_id=API_ID,
@@ -153,10 +176,18 @@ def _build_ffmpeg_cmd(filepath: str, is_video: bool, rtmp_target: str,
     # list here and inserted right before the actual media file's -i
     # in every branch, so it always seeks the right thing.
     seek = ["-ss", f"{resume_seconds:.2f}"] if resume_seconds > 0 else []
+    scale_filter = None  # only set for real video sources, below
 
     if is_video:
         cmd += [*seek, "-re", "-i", filepath]
         video_map, audio_map = ["-map", "0:v:0"], ["-map", "0:a:0?"]
+        # Downscale only if the source is taller than RTMP_MAX_HEIGHT —
+        # force_original_aspect_ratio=decrease avoids upscaling smaller
+        # sources, and the even-dimension expression avoids libx264
+        # rejecting an odd width/height after scaling.
+        scale_filter = (
+            f"scale=-2:'min({RTMP_MAX_HEIGHT},ih)':force_original_aspect_ratio=decrease"
+        )
     elif cover_path:
         # Audio-only source with real cover art (embedded ID3 art, or
         # the downloaded YouTube thumbnail): loop the still image as
@@ -176,7 +207,8 @@ def _build_ffmpeg_cmd(filepath: str, is_video: bool, rtmp_target: str,
 
     cmd += [
         *video_map, *audio_map,
-        "-c:v", "libx264", "-preset", "veryfast", "-b:v", "2500k",
+        *(["-vf", scale_filter] if scale_filter else []),
+        "-c:v", "libx264", "-preset", RTMP_ENCODE_PRESET, "-b:v", RTMP_VIDEO_BITRATE,
         "-g", "60", "-keyint_min", "60",  # ~2s keyframe interval at 30fps — Telegram's RTMP ingest expects steady keyframes
         "-pix_fmt", "yuv420p",  # still-image inputs default to yuvj420p, which some RTMP receivers reject
         "-c:a", "aac", "-b:a", "128k", "-ar", "44100",
@@ -204,16 +236,37 @@ async def _stop_ffmpeg_only(suppress_callback: bool):
 
 
 async def _watch_ffmpeg(proc: asyncio.subprocess.Process, filepath: str):
-    """Waits for ffmpeg to exit and logs stderr on a non-signal exit so
-    RTMP rejection reasons aren't silently lost. Fires
-    on_finished_callback only when this wasn't a suppressed
-    (pause/skip/replace) stop."""
+    """Waits for ffmpeg to exit and logs stderr on a genuinely
+    unexpected exit so RTMP rejection reasons aren't silently lost.
+    Fires on_finished_callback only when this wasn't a suppressed
+    (pause/skip/replace/shutdown) stop.
+
+    Exit-code classification uses `suppressed` (whether WE asked
+    ffmpeg to stop via SIGTERM) rather than the raw exit code alone —
+    ffmpeg has a documented quirk where it doesn't die with a
+    signal-indicated code when interrupted: it catches SIGTERM, tries
+    to wind down/flush what it can, and exits with its own code 255
+    regardless (confirmed in ffmpeg's own issue tracker — this isn't
+    guessed). An earlier version of this check treated any code other
+    than exactly 0/None/-SIGTERM as an error, which meant every
+    intentional stop (pause, skip, or the bot process itself shutting
+    down/redeploying) logged a scary ERROR block even though nothing
+    was actually wrong — it was just us asking ffmpeg to stop. Now:
+    if we asked it to stop, 255 is expected and logged quietly; if
+    ffmpeg exited on its OWN (we never signaled it) with a nonzero
+    code, that's the case actually worth an ERROR log."""
     global _suppress_finish_callback
     _, stderr = await proc.communicate()
     suppressed = _suppress_finish_callback
     _suppress_finish_callback = False
 
-    if proc.returncode not in (0, None, -signal.SIGTERM):
+    expected_self_stop_codes = (0, None, -signal.SIGTERM, -signal.SIGKILL, 255)
+    if suppressed and proc.returncode in expected_self_stop_codes:
+        log.info(
+            "ffmpeg RTMP push for %s stopped as requested (exit code %s)",
+            filepath, proc.returncode,
+        )
+    elif proc.returncode not in (0, None):
         log.error(
             "ffmpeg RTMP push for %s exited with code %s:\n%s",
             filepath, proc.returncode, stderr.decode(errors="replace")[-2000:],
