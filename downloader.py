@@ -101,40 +101,30 @@ POT_PROVIDER_BASE_URL = os.environ.get("POT_PROVIDER_BASE_URL", "").strip()
 # exactly like before.
 YT_PROXY = os.environ.get("YT_PROXY", "").strip()
 
-# Player clients to try, in order. Corrected mid-2026 after checking
-# yt-dlp's current PO Token Guide and bgutil-ytdlp-pot-provider's own
-# docs — the previous list (android,ios,web_safari,web) was subtly
-# wrong:
-#   - PO tokens are platform-specific and NOT interchangeable — a Web
-#     token cannot be used on Android or iOS at all (yt-dlp's PO Token
-#     Guide is explicit about this). Android/iOS need their own
-#     DroidGuard/iOSGuard-generated tokens, which bgutil-ytdlp-pot-
-#     provider does NOT generate (it only does the web-family
-#     BotGuard token). So the old list spent its first two attempts on
-#     clients our installed plugin literally cannot help, before ever
-#     reaching one it can.
-#   - yt-dlp's own PO Token Guide TL;DR, current as of this fix:
-#     "Use a PO Token Provider plugin to provide the mweb client with
-#     a PO Token for GVS requests" — mweb (mobile web), not web, is
-#     the officially recommended pairing with this plugin.
-# New order: mweb and web_safari first (both confirmed working with
-# bgutil in yt-dlp's own recent issue tracker — #15789, #15571), web
-# next (also works, just the most bot-detection-scrutinized), android
-# as a last-ditch attempt in case a specific video happens to still be
-# ungated on it. 'tv' remains excluded: pairing it with cookies can
-# invalidate the cookie session entirely rather than helping.
-#
-# UPDATE (found via the diagnostic trace + current yt-dlp issue
-# tracker, including reports from this same month): YouTube has been
-# rolling out forced SABR-only streaming specifically on web_safari —
-# its formats still get LISTED, but their URLs are stripped, so no
-# format-selector string can make them downloadable no matter what
-# (yt-dlp issue #16974). This isn't a filter-syntax problem to tune
-# around; those formats are just genuinely unusable while that's
-# active. Demoted web_safari to last, after android, so a client
-# that's currently SABR-gated doesn't get tried before ones that
-# aren't (yet).
-YT_PLAYER_CLIENTS = "mweb,web,android,web_safari"
+# Player clients to try, in order, WITH cookies. All three confirmed
+# (via a real diagnostic trace) to successfully retrieve a PO token —
+# authentication is not the problem for these. The problem, confirmed
+# by the same trace, is that YouTube is now forcing SABR-only streaming
+# on browser-facing clients for at least some videos: formats are still
+# LISTED but their URLs are stripped, so no format-selector string can
+# make them downloadable (yt-dlp issue #12482/#16974) — no ordering of
+# these three clients fixes that, since it can affect any/all of them
+# depending on the video. That's what YT_FALLBACK_CLIENTS below is for.
+YT_PLAYER_CLIENTS = "mweb,web,web_safari"
+
+# Fallback clients for when ALL of the above come back SABR-gated (every
+# https format present but stripped of its URL — confirmed via a real
+# trace: "Only images are available for download"). App clients
+# (android/ios) aren't yet subject to SABR the way browser-facing
+# clients are, per the same yt-dlp issue tracker (#12482) — but yt-dlp
+# itself refuses to combine them with cookies (confirmed: "Skipping
+# client 'android' since it does not support cookies"), so this list is
+# only ever tried in a SEPARATE cookie-free attempt, never merged into
+# YT_PLAYER_CLIENTS above. No PO token needed either: our plugin can't
+# generate the Android/iOS token type in the first place (see the
+# YT_PLAYER_CLIENTS comment above), and these clients don't require one
+# as of this fix.
+YT_FALLBACK_CLIENTS = "android,ios"
 
 # Format selector: multi-tier fallback, INCLUDING a bare "best" at the
 # end now — that used to be deliberately excluded (see the historical
@@ -239,8 +229,18 @@ def _get_writable_cookies_file():
     return dest
 
 
-def _base_opts() -> dict:
-    """Options shared by every yt-dlp call."""
+def _base_opts(player_clients: list | None = None, use_cookies: bool = True) -> dict:
+    """Options shared by every yt-dlp call.
+    player_clients: override the client list for this call specifically
+    (used by the no-cookies SABR-fallback attempt below). Defaults to
+    YT_PLAYER_CLIENTS when not given.
+    use_cookies: pass False to build opts with no cookiefile at all —
+    required for the android/ios fallback, since yt-dlp itself refuses
+    to combine those clients with cookies (confirmed in a real trace:
+    'Skipping client "android" since it does not support cookies') —
+    passing cookies AND wanting android tried is a contradiction yt-dlp
+    resolves by silently dropping android, not by using it cookie-free.
+    """
     # BUG FIXED HERE (found via the diagnostic trace's debug params
     # dump showing 'player_client': ['mweb,web_safari,web,android'] —
     # note the outer brackets: that's a ONE-element list containing a
@@ -256,7 +256,8 @@ def _base_opts() -> dict:
     # working. This means every player-client tuning done earlier in
     # this bot's history never actually took effect until this fix —
     # .split(",") is what makes it a real list of 4 client names.
-    extractor_args = {"youtube": {"player_client": YT_PLAYER_CLIENTS.split(",")}}
+    clients = player_clients if player_clients is not None else YT_PLAYER_CLIENTS.split(",")
+    extractor_args = {"youtube": {"player_client": clients}}
 
     if POT_PROVIDER_BASE_URL:
         # Tells the bgutil plugin where its companion token-server lives.
@@ -275,9 +276,10 @@ def _base_opts() -> dict:
         # player change.
         "cachedir": False,
     }
-    cookies_path = _get_writable_cookies_file()
-    if cookies_path:
-        opts["cookiefile"] = cookies_path
+    if use_cookies:
+        cookies_path = _get_writable_cookies_file()
+        if cookies_path:
+            opts["cookiefile"] = cookies_path
     if YT_PROXY:
         # See YT_PROXY's definition above: on datacenter hosts, this is
         # often the only thing that actually clears YouTube's bot check,
@@ -588,14 +590,17 @@ def _diagnose_youtube_failure(url: str):
         log.exception("Diagnostic capture itself failed (non-fatal, ignoring)")
 
 
-def _run_ytdlp(url: str, audio_only: bool) -> DownloadResult:
-    _validate_url(url)
-    job_dir = _job_dir()
-    out_tmpl = os.path.join(job_dir, "%(id)s.%(ext)s")
-
+def _attempt_ytdlp_download(url: str, audio_only: bool, out_tmpl: str,
+                             player_clients: list, use_cookies: bool):
+    """One yt-dlp download attempt with a specific client list/cookie
+    setting. Raises yt_dlp.utils.DownloadError on failure — callers
+    decide whether to try a different attempt or give up. Factored out
+    of _run_ytdlp so the same logic serves both the primary (cookies +
+    browser-facing clients) and fallback (no cookies + app clients)
+    attempts identically."""
     if audio_only:
         ydl_opts = {
-            **_base_opts(),
+            **_base_opts(player_clients, use_cookies),
             "format": "bestaudio/best",
             "outtmpl": out_tmpl,
             "postprocessors": [{
@@ -611,38 +616,69 @@ def _run_ytdlp(url: str, audio_only: bool) -> DownloadResult:
         # check below independently catches an audio-only result
         # regardless of which fallback tier produced it.
         ydl_opts = {
-            **_base_opts(),
+            **_base_opts(player_clients, use_cookies),
             "format": YT_VIDEO_FORMAT,
             "outtmpl": out_tmpl,
             "merge_output_format": "mp4",
         }
 
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        info = ydl.extract_info(url, download=True)
+        filepath = ydl.prepare_filename(info)
+        if audio_only:
+            filepath = os.path.splitext(filepath)[0] + ".opus"
+        elif info.get("requested_downloads"):
+            # merged output filename can differ from prepare_filename
+            # when yt-dlp merges separate video+audio into one file
+            filepath = info["requested_downloads"][0].get("filepath", filepath)
+    return info, filepath
+
+
+def _run_ytdlp(url: str, audio_only: bool) -> DownloadResult:
+    _validate_url(url)
+    job_dir = _job_dir()
+    out_tmpl = os.path.join(job_dir, "%(id)s.%(ext)s")
+
+    primary_clients = YT_PLAYER_CLIENTS.split(",")
     try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=True)
-            filepath = ydl.prepare_filename(info)
-            if audio_only:
-                filepath = os.path.splitext(filepath)[0] + ".opus"
-            elif info.get("requested_downloads"):
-                # merged output filename can differ from prepare_filename
-                # when yt-dlp merges separate video+audio into one file
-                filepath = info["requested_downloads"][0].get("filepath", filepath)
-    except yt_dlp.utils.DownloadError as e:
-        msg = str(e)
-        # Run diagnostics on ANY yt-dlp failure here now, not just
-        # messages containing "reloaded"/"sign in" — that substring
-        # check missed "Requested format is not available" entirely
-        # (a real failure mode this bot hit), and there's no reason to
-        # assume we've seen every phrasing YouTube/yt-dlp will ever
-        # produce. Best-effort and swallowed internally either way, so
-        # this costs nothing when the extra trace isn't needed.
-        _diagnose_youtube_failure(url)
-        if "reloaded" in msg.lower() or "sign in" in msg.lower():
-            raise DownloadError(_friendly_blocked_message())
-        raise DownloadError(
-            f"{msg}\n\n(A detailed diagnostic trace was written to the "
-            f"server logs above this error, if you need to dig further.)"
+        info, filepath = _attempt_ytdlp_download(url, audio_only, out_tmpl, primary_clients, use_cookies=True)
+    except yt_dlp.utils.DownloadError as primary_err:
+        # Real fallback, not another guess: try app clients (android/ios)
+        # with NO cookies. Confirmed necessary via a real trace —
+        # yt-dlp itself refuses to combine android with cookies
+        # ("Skipping client 'android' since it does not support
+        # cookies"), so the primary attempt above never actually tries
+        # it while COOKIES_FILE is set. App clients aren't (yet)
+        # subject to the browser-facing SABR gating that was the
+        # primary attempt's actual failure (see YT_FALLBACK_CLIENTS'
+        # definition above) — this is a genuinely different code path,
+        # not the same request retried.
+        log.warning(
+            "Primary yt-dlp attempt (%s, with cookies) failed for %s: %s "
+            "— trying fallback clients (%s, no cookies)",
+            primary_clients, url, primary_err, YT_FALLBACK_CLIENTS,
         )
+        try:
+            info, filepath = _attempt_ytdlp_download(
+                url, audio_only, out_tmpl,
+                YT_FALLBACK_CLIENTS.split(","), use_cookies=False,
+            )
+            log.info("Fallback attempt succeeded for %s", url)
+        except yt_dlp.utils.DownloadError as fallback_err:
+            # Both attempts failed — now it's worth the diagnostic
+            # trace's cost, and worth telling the person clearly that
+            # two different approaches were tried, not one.
+            msg = str(fallback_err)
+            _diagnose_youtube_failure(url)
+            if "reloaded" in msg.lower() or "sign in" in str(primary_err).lower():
+                raise DownloadError(_friendly_blocked_message())
+            raise DownloadError(
+                f"Tried twice — with cookies ({', '.join(primary_clients)}) "
+                f"and without ({YT_FALLBACK_CLIENTS}) — both failed. "
+                f"Last error: {msg}\n\n(A detailed diagnostic trace was "
+                f"written to the server logs above this error, if you "
+                f"need to dig further.)"
+            )
 
     if not audio_only:
         if not _has_any_video_stream(filepath):
