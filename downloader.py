@@ -212,7 +212,22 @@ def _get_writable_cookies_file():
 
 def _base_opts() -> dict:
     """Options shared by every yt-dlp call."""
-    extractor_args = {"youtube": {"player_client": [YT_PLAYER_CLIENTS]}}
+    # BUG FIXED HERE (found via the diagnostic trace's debug params
+    # dump showing 'player_client': ['mweb,web_safari,web,android'] —
+    # note the outer brackets: that's a ONE-element list containing a
+    # single comma-joined string, not four separate client names).
+    # yt-dlp's Python API (unlike its CLI, which parses
+    # --extractor-args itself) needs each client as its own list
+    # element. With the comma-string form, yt-dlp didn't recognize any
+    # of our intended clients and silently fell back to its OWN
+    # internal default client order instead — which is how a request
+    # for mweb/web_safari/web/android ended up actually trying
+    # 'visionos' (visible in the trace as "Downloading visionos player
+    # API JSON"), a client we never asked for and had zero chance of
+    # working. This means every player-client tuning done earlier in
+    # this bot's history never actually took effect until this fix —
+    # .split(",") is what makes it a real list of 4 client names.
+    extractor_args = {"youtube": {"player_client": YT_PLAYER_CLIENTS.split(",")}}
 
     if POT_PROVIDER_BASE_URL:
         # Tells the bgutil plugin where its companion token-server lives.
