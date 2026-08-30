@@ -123,7 +123,36 @@ YT_PROXY = os.environ.get("YT_PROXY", "").strip()
 # as a last-ditch attempt in case a specific video happens to still be
 # ungated on it. 'tv' remains excluded: pairing it with cookies can
 # invalidate the cookie session entirely rather than helping.
-YT_PLAYER_CLIENTS = "mweb,web_safari,web,android"
+#
+# UPDATE (found via the diagnostic trace + current yt-dlp issue
+# tracker, including reports from this same month): YouTube has been
+# rolling out forced SABR-only streaming specifically on web_safari —
+# its formats still get LISTED, but their URLs are stripped, so no
+# format-selector string can make them downloadable no matter what
+# (yt-dlp issue #16974). This isn't a filter-syntax problem to tune
+# around; those formats are just genuinely unusable while that's
+# active. Demoted web_safari to last, after android, so a client
+# that's currently SABR-gated doesn't get tried before ones that
+# aren't (yet).
+YT_PLAYER_CLIENTS = "mweb,web,android,web_safari"
+
+# Format selector: multi-tier fallback, INCLUDING a bare "best" at the
+# end now — that used to be deliberately excluded (see the historical
+# note in _run_ytdlp below) specifically because a bare "best" could
+# silently ship an audio-only file when video formats failed to
+# resolve. That's no longer a silent risk: the post-download ffprobe
+# check further down (_has_any_video_stream / _has_real_video_stream)
+# independently rejects an audio-only result regardless of which tier
+# of this selector produced it, so it's safe to have a real fallback
+# chain instead of hard-failing whenever the strict first tier doesn't
+# match — which turned out to be too strict against clients (mweb,
+# android) that don't always tag every format with a `height` field.
+YT_VIDEO_FORMAT = (
+    "bestvideo[height<=1080]+bestaudio/"
+    "bestvideo+bestaudio/"
+    "best[height<=1080]/"
+    "best"
+)
 
 _URL_RE = re.compile(r"^https?://", re.IGNORECASE)
 
@@ -524,13 +553,14 @@ def _run_ytdlp(url: str, audio_only: bool) -> DownloadResult:
             }],
         }
     else:
-        # Deliberately does NOT fall back to a bare "best" at the end —
-        # that's what let a broken video extraction silently downgrade to
-        # an audio-only stream before. If no real video+audio combo
-        # resolves, this fails loudly instead of shipping audio-only.
+        # Uses YT_VIDEO_FORMAT — see its definition above for why a
+        # bare "best" fallback is safe now (it wasn't when this
+        # comment used to say otherwise): the post-download ffprobe
+        # check below independently catches an audio-only result
+        # regardless of which fallback tier produced it.
         ydl_opts = {
             **_base_opts(),
-            "format": "bestvideo[height<=1080]+bestaudio/best[height<=1080][vcodec!=none]",
+            "format": YT_VIDEO_FORMAT,
             "outtmpl": out_tmpl,
             "merge_output_format": "mp4",
         }
@@ -547,10 +577,20 @@ def _run_ytdlp(url: str, audio_only: bool) -> DownloadResult:
                 filepath = info["requested_downloads"][0].get("filepath", filepath)
     except yt_dlp.utils.DownloadError as e:
         msg = str(e)
+        # Run diagnostics on ANY yt-dlp failure here now, not just
+        # messages containing "reloaded"/"sign in" — that substring
+        # check missed "Requested format is not available" entirely
+        # (a real failure mode this bot hit), and there's no reason to
+        # assume we've seen every phrasing YouTube/yt-dlp will ever
+        # produce. Best-effort and swallowed internally either way, so
+        # this costs nothing when the extra trace isn't needed.
+        _diagnose_youtube_failure(url)
         if "reloaded" in msg.lower() or "sign in" in msg.lower():
-            _diagnose_youtube_failure(url)
             raise DownloadError(_friendly_blocked_message())
-        raise DownloadError(msg)
+        raise DownloadError(
+            f"{msg}\n\n(A detailed diagnostic trace was written to the "
+            f"server logs above this error, if you need to dig further.)"
+        )
 
     if not audio_only:
         if not _has_any_video_stream(filepath):
