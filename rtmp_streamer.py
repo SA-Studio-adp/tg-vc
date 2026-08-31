@@ -85,6 +85,31 @@ RTMP_VIDEO_BITRATE = os.environ.get("RTMP_VIDEO_BITRATE", "1800k").strip()
 # only affects the is_video=True branch.
 RTMP_MAX_HEIGHT = os.environ.get("RTMP_MAX_HEIGHT", "720").strip()
 
+# VBV rate-control buffer (-maxrate/-bufsize): without these, x264's
+# rate control can let the encoded bitrate burst well above -b:v
+# during complex frames, and on a CPU-constrained host combined with
+# -re real-time pacing, that burst is what causes the encoder to
+# briefly fall behind and produce a visible stall-then-catch-up —
+# exactly a "few seconds of break, then it continues" pattern rather
+# than constant lag. This is a well-established fix (confirmed against
+# multiple real-world VPS/RTMP-push writeups making the identical
+# change for the identical symptom), not a guess: -maxrate caps the
+# instantaneous rate at the same ceiling as the target bitrate, and
+# -bufsize gives the encoder a tolerance window to spend before that
+# cap kicks in. 2x the target bitrate is the commonly used ratio for
+# this — tight enough to prevent long stalls, loose enough not to
+# force the encoder into starving quality on busy scenes.
+RTMP_BUFSIZE_MULTIPLIER = 2
+
+# Explicit, FIXED output frame rate. Source videos can be 24/25/30/60fps
+# — without forcing one consistent value here, -g 60 (below) doesn't
+# reliably mean "~2 seconds between keyframes" the comment claims, it
+# means "60 frames," which is a different amount of time depending on
+# the source's actual rate. Forcing -r here (and matching the cover/
+# black-frame lavfi sources to the same value) makes the GOP length
+# actually deterministic.
+RTMP_OUTPUT_FPS = 30
+
 pyro_client = Client(
     "userbot_rtmp",
     api_id=API_ID,
@@ -178,8 +203,16 @@ def _build_ffmpeg_cmd(filepath: str, is_video: bool, rtmp_target: str,
     seek = ["-ss", f"{resume_seconds:.2f}"] if resume_seconds > 0 else []
     scale_filter = None  # only set for real video sources, below
 
+    # -thread_queue_size raises ffmpeg's default per-input read-ahead
+    # buffer (default is a small 8 packets) — too small under real-time
+    # (-re) pacing combined with any encode-side slowdown, which causes
+    # the INPUT read to itself stall and contributes to the same
+    # stutter-then-catch-up pattern this whole function is fixing.
+    # Applied to every input, not just the main media file.
+    thread_queue = ["-thread_queue_size", "512"]
+
     if is_video:
-        cmd += [*seek, "-re", "-i", filepath]
+        cmd += [*thread_queue, *seek, "-re", "-i", filepath]
         video_map, audio_map = ["-map", "0:v:0"], ["-map", "0:a:0?"]
         # Downscale only if the source is taller than RTMP_MAX_HEIGHT —
         # force_original_aspect_ratio=decrease avoids upscaling smaller
@@ -193,25 +226,44 @@ def _build_ffmpeg_cmd(filepath: str, is_video: bool, rtmp_target: str,
         # the downloaded YouTube thumbnail): loop the still image as
         # the video track instead of a black frame. -shortest trims
         # the (infinite) looped image down to the audio's actual
-        # length.
-        cmd += ["-loop", "1", "-framerate", "25", "-i", cover_path]
-        cmd += [*seek, "-re", "-i", filepath]
+        # length. Framerate matches RTMP_OUTPUT_FPS (not a separate
+        # hardcoded 25) so the -g keyframe-interval math below is
+        # actually correct for this path too.
+        cmd += [*thread_queue, "-loop", "1", "-framerate", str(RTMP_OUTPUT_FPS), "-i", cover_path]
+        cmd += [*thread_queue, *seek, "-re", "-i", filepath]
         video_map, audio_map = ["-map", "0:v:0"], ["-map", "1:a:0?"]
         cmd += ["-shortest"]
     else:
         # No cover art available — fall back to a synthetic black frame.
-        cmd += ["-f", "lavfi", "-i", "color=c=black:s=1280x720:r=25"]
-        cmd += [*seek, "-re", "-i", filepath]
+        cmd += [*thread_queue, "-f", "lavfi", "-i", f"color=c=black:s=1280x720:r={RTMP_OUTPUT_FPS}"]
+        cmd += [*thread_queue, *seek, "-re", "-i", filepath]
         video_map, audio_map = ["-map", "0:v:0"], ["-map", "1:a:0?"]
         cmd += ["-shortest"]
 
+    # bufsize = 2x the target bitrate — see RTMP_BUFSIZE_MULTIPLIER's
+    # definition above for why. Both parsed from the "1800k"-style
+    # string into a plain kbit number for the arithmetic, then
+    # formatted back the same way ffmpeg expects.
+    bitrate_kbps = int(RTMP_VIDEO_BITRATE.rstrip("kK"))
+    bufsize = f"{bitrate_kbps * RTMP_BUFSIZE_MULTIPLIER}k"
+
+    gop = RTMP_OUTPUT_FPS * 2  # ~2s between keyframes, now actually accurate — see RTMP_OUTPUT_FPS above
     cmd += [
         *video_map, *audio_map,
         *(["-vf", scale_filter] if scale_filter else []),
-        "-c:v", "libx264", "-preset", RTMP_ENCODE_PRESET, "-b:v", RTMP_VIDEO_BITRATE,
-        "-g", "60", "-keyint_min", "60",  # ~2s keyframe interval at 30fps — Telegram's RTMP ingest expects steady keyframes
+        "-r", str(RTMP_OUTPUT_FPS),
+        "-c:v", "libx264", "-preset", RTMP_ENCODE_PRESET,
+        "-b:v", RTMP_VIDEO_BITRATE, "-maxrate", RTMP_VIDEO_BITRATE, "-bufsize", bufsize,
+        "-g", str(gop), "-keyint_min", str(gop),
         "-pix_fmt", "yuv420p",  # still-image inputs default to yuvj420p, which some RTMP receivers reject
         "-c:a", "aac", "-b:a", "128k", "-ar", "44100",
+        # Absorbs a transient encode/mux slowdown as a growing queue
+        # instead of ffmpeg hard-erroring with "Too many packets
+        # buffered for output stream" and dying mid-stream — a second,
+        # independent safety net alongside -bufsize above (that one
+        # smooths the ENCODED bitrate; this one protects the muxer
+        # from a backlog if something upstream still hiccups).
+        "-max_muxing_queue_size", "1024",
         "-f", "flv", rtmp_target,
     ]
     return cmd
