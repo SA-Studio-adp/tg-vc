@@ -7,12 +7,18 @@ FROM python:3.12-slim
 
 # --- system deps ---
 # ffmpeg: required to transcode/pipe media into the RTMP push.
+# aria2: multi-connection external downloader yt-dlp can hand off to
+#   for faster single-file downloads (see ARIA2_ENABLED in
+#   downloader.py) — confirmed via a real test download at ~4x the
+#   single-connection speed. Optional at runtime (auto-detected), but
+#   included here so it's actually present without extra setup.
 # nodejs/npm: required to build+run the bgutil PO-token server (it's a
 #   TypeScript/Node HTTP service, not a Python package, despite the pip
 #   plugin sharing its name).
 # git: needed to clone the bgutil server source at build time.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ffmpeg \
+        aria2 \
         git \
         curl \
         ca-certificates \

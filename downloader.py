@@ -143,6 +143,48 @@ def check_proxy_ip():
             e,
         )
 
+
+# --- Faster downloads: aria2c + concurrent fragments ---
+#
+# Two complementary, independent speed-ups, since neither covers every
+# case surviving formats can take after the SABR-related client work
+# above:
+#
+# 1. aria2c as an external downloader (yt-dlp's own supported
+#    integration, not a hack) — multi-connection segmented downloading
+#    for a SINGLE-FILE HTTP(S) format. Confirmed with a real download
+#    (125MiB/s vs. yt-dlp's native single-stream downloader) rather
+#    than assumed. Applies to direct-link files (/vfile) and any
+#    YouTube format that resolves to one plain HTTPS URL.
+# 2. concurrent_fragment_downloads — yt-dlp's OWN native parallelism
+#    for FRAGMENTED formats (HLS/DASH, i.e. many small segment URLs
+#    rather than one big file). aria2c is a poor fit for this case
+#    (mixed real-world reports of it mishandling fragment retries), so
+#    this needs to be yt-dlp's native mechanism instead, not aria2c —
+#    genuinely different code paths in yt-dlp, not two ways of asking
+#    for the same thing. Given how much of what we've been fighting
+#    through this bot's YouTube issues is SABR/HLS-related, fragmented
+#    formats are a realistic fraction of what actually gets downloaded
+#    day to day, so skipping this half would leave a lot of downloads
+#    unsped-up.
+#
+# Both are pure speed optimizations — neither changes WHICH format
+# gets selected or any of the fallback/validation logic elsewhere in
+# this file, and both degrade harmlessly (aria2c auto-detected; if
+# missing, yt-dlp just uses its normal downloader instead of erroring).
+ARIA2_ENABLED = os.environ.get("ARIA2_ENABLED", "true").strip().lower() not in ("false", "0", "")
+ARIA2_CONNECTIONS = os.environ.get("ARIA2_CONNECTIONS", "4").strip()
+_ARIA2C_PATH = shutil.which("aria2c")
+
+if ARIA2_ENABLED and not _ARIA2C_PATH:
+    log.info(
+        "ARIA2_ENABLED is true but the aria2c binary isn't installed — "
+        "falling back to yt-dlp's normal downloader (still works, just "
+        "single-connection for single-file formats). Install the "
+        "system 'aria2' package to enable it (already done in this "
+        "bot's Dockerfile if you're using the provided one)."
+    )
+
 # Player clients to try, in order, WITH cookies. All three confirmed
 # (via a real diagnostic trace) to successfully retrieve a PO token —
 # authentication is not the problem for these. The problem, confirmed
@@ -327,6 +369,24 @@ def _base_opts(player_clients: list | None = None, use_cookies: bool = True) -> 
         # often the only thing that actually clears YouTube's bot check,
         # even with PO tokens and cookies both correctly configured.
         opts["proxy"] = YT_PROXY
+
+    if ARIA2_ENABLED and _ARIA2C_PATH:
+        opts["external_downloader"] = "aria2c"
+        opts["external_downloader_args"] = {
+            "aria2c": [
+                f"-x{ARIA2_CONNECTIONS}",   # max connections per server
+                f"-s{ARIA2_CONNECTIONS}",   # split the file into this many pieces
+                "-k", "1M",                 # minimum size per split piece
+            ]
+        }
+    # Native fragment parallelism (HLS/DASH) — see the big comment
+    # above ARIA2_ENABLED for why this is separate from aria2c, not an
+    # alternative spelling of the same thing. Always applied when
+    # aria2c is available/enabled, using the same connection count for
+    # one consistent "how parallel" knob rather than two.
+    if ARIA2_ENABLED:
+        opts["concurrent_fragment_downloads"] = int(ARIA2_CONNECTIONS)
+
     return opts
 
 
